@@ -1,0 +1,16 @@
+# Ignore all results directories
+results/
+**/results/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Media and document files
+*.png
+*.pdf
+
+# OS files
+.DS_Store
