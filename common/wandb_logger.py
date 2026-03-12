@@ -17,7 +17,7 @@ def init_wandb(cfg, depth, act_fn):
     """
     from dataclasses import asdict
 
-    run_name = f"{cfg.variant}_{act_fn}_d{depth}"
+    run_name = cfg.wandb_run_name or f"{cfg.variant}_{act_fn}_d{depth}"
     config_dict = asdict(cfg)
     config_dict["depth"] = depth
     config_dict["act_fn"] = act_fn

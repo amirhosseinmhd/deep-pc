@@ -45,6 +45,7 @@ def run_single(cfg):
             model = variant.create_model(
                 key, depth=depth, width=cfg.width, act_fn=act_fn,
                 init_alpha=cfg.init_alpha,
+                activity_noise=cfg.activity_noise,
             )
 
             res = train_and_record(
@@ -63,6 +64,8 @@ def run_single(cfg):
                 track_grad_norms=cfg.track_grad_norms,
                 track_layer_energy=cfg.track_layer_energy,
                 inference_multiplier=cfg.inference_multiplier,
+                activity_init=cfg.activity_init,
+                param_optim_type=cfg.param_optim_type,
                 use_wandb=use_wandb,
             )
             depth_results[depth] = res
@@ -144,6 +147,18 @@ def main():
         "--inference-multiplier", type=float, default=None,
         help="Multiply inference steps by this factor (default: 1, i.e. depth steps)",
     )
+    parser.add_argument(
+        "--activity-init", choices=["ffwd", "zeros"], default=None,
+        help="Activity initialization: 'ffwd' (forward pass) or 'zeros' (default: ffwd)",
+    )
+    parser.add_argument(
+        "--param-optim", choices=["adam", "sgd"], default=None,
+        help="Parameter optimizer: 'adam' or 'sgd' (default: adam)",
+    )
+    parser.add_argument(
+        "--activity-noise", type=float, default=None,
+        help="Noise scale for activity init (dyt_v2 experiment, default: 0.0)",
+    )
     # W&B arguments
     parser.add_argument(
         "--no-wandb", action="store_true",
@@ -156,6 +171,10 @@ def main():
     parser.add_argument(
         "--wandb-entity", type=str, default=None,
         help="W&B entity (team or username)",
+    )
+    parser.add_argument(
+        "--wandb-run-name", type=str, default=None,
+        help="Custom W&B run name (default: variant_actfn_dDEPTH)",
     )
     args = parser.parse_args()
 
@@ -185,12 +204,20 @@ def main():
             overrides["track_layer_energy"] = False
         if args.inference_multiplier:
             overrides["inference_multiplier"] = args.inference_multiplier
+        if args.activity_init:
+            overrides["activity_init"] = args.activity_init
+        if args.param_optim:
+            overrides["param_optim_type"] = args.param_optim
+        if args.activity_noise is not None:
+            overrides["activity_noise"] = args.activity_noise
         if args.no_wandb:
             overrides["use_wandb"] = False
         if args.wandb_project:
             overrides["wandb_project"] = args.wandb_project
         if args.wandb_entity:
             overrides["wandb_entity"] = args.wandb_entity
+        if args.wandb_run_name:
+            overrides["wandb_run_name"] = args.wandb_run_name
 
         cfg = ExperimentConfig.from_variant(variant_name, **overrides)
         print(f"\n{'='*60}")

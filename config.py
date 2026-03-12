@@ -30,8 +30,8 @@ SEED = 42
 ACTIVITY_LR = 5e-1
 PARAM_LR = 1e-3
 BATCH_SIZE = 128
-TEST_EVERY = 50
-N_TRAIN_ITERS = 10000
+TEST_EVERY = 1
+N_TRAIN_ITERS = 1000
 
 # ---------------------------------------------------------------------------
 # Condition number experiment
@@ -47,12 +47,13 @@ VARIANT_BF = "bf"
 VARIANT_BF_V2 = "bf_v2"
 VARIANT_DYT = "dyt"
 VARIANT_DYT_V2 = "dyt_v2"
+VARIANT_DYT_V3 = "dyt_v3"
 VARIANT_MUPC = "mupc"
 
 ALL_VARIANTS = [
     VARIANT_BASELINE, VARIANT_RESNET, VARIANT_BF,
     VARIANT_BF_V2, VARIANT_DYT, VARIANT_DYT_V2,
-    VARIANT_MUPC,
+    VARIANT_DYT_V3, VARIANT_MUPC,
 ]
 
 
@@ -92,6 +93,7 @@ class ExperimentConfig:
 
     # DyT-specific
     init_alpha: float = 0.5
+    activity_noise: float = 0.0
 
     # Condition number experiment
     cond_width: int = COND_WIDTH

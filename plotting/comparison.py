@@ -16,6 +16,7 @@ VARIANT_COLORS = {
     "bf_v2": '#d62728',
     "dyt": '#9467bd',
     "dyt_v2": '#8c564b',
+    "dyt_v3": '#e377c2',
 }
 
 VARIANT_LABELS = {
@@ -25,6 +26,7 @@ VARIANT_LABELS = {
     "bf_v2": "BF ResNet v2",
     "dyt": "DyT ResNet",
     "dyt_v2": "DyT ResNet v2",
+    "dyt_v3": "DyT ResNet v3",
 }
 
 
