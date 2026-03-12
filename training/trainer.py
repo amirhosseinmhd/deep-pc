@@ -6,7 +6,7 @@ from jax import vmap
 import jpc
 import optax
 
-from common.data import set_seed, get_mnist_loaders
+from common.data import set_seed, get_dataloaders
 from common.metrics import MetricsCollector
 from common.utils import selected_layer_indices
 
@@ -22,6 +22,7 @@ def train_and_record(
     n_train_iters,
     test_every,
     act_fn,
+    dataset="MNIST",
     track_weight_updates=True,
     track_activity_norms=True,
     track_grad_norms=True,
@@ -58,7 +59,7 @@ def train_and_record(
         param_optim = optax.adam(param_lr, eps=1e-12)
     param_opt_state = param_optim.init(variant.get_optimizer_target(model))
 
-    train_loader, test_loader = get_mnist_loaders(batch_size)
+    train_loader, test_loader = get_dataloaders(dataset, batch_size)
 
     metrics = MetricsCollector(
         track_weight_updates=track_weight_updates,

@@ -10,6 +10,8 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from common.data import get_input_dim
+
 # ---------------------------------------------------------------------------
 # Project paths
 # ---------------------------------------------------------------------------
@@ -17,9 +19,10 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
 
 # ---------------------------------------------------------------------------
-# Model architecture
+# Dataset & model architecture
 # ---------------------------------------------------------------------------
-INPUT_DIM = 784
+DATASET = "MNIST"
+INPUT_DIM = get_input_dim(DATASET)  # 784 for MNIST, 3072 for CIFAR10
 OUTPUT_DIM = 10
 WIDTH = 128
 
@@ -67,6 +70,9 @@ class ExperimentConfig:
     # Variant
     variant: str = VARIANT_RESNET
 
+    # Dataset
+    dataset: str = DATASET
+
     # Architecture
     input_dim: int = INPUT_DIM
     output_dim: int = OUTPUT_DIM
@@ -108,6 +114,8 @@ class ExperimentConfig:
     results_dir: Optional[str] = None
 
     def __post_init__(self):
+        # Derive input_dim from dataset
+        self.input_dim = get_input_dim(self.dataset)
         if self.results_dir is None:
             self.results_dir = os.path.join(RESULTS_DIR, self.variant)
 

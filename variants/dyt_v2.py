@@ -17,7 +17,7 @@ import equinox.nn as nn
 
 from typing import List, Callable
 
-from config import INPUT_DIM, OUTPUT_DIM
+from config import INPUT_DIM as _DEFAULT_INPUT_DIM, OUTPUT_DIM as _DEFAULT_OUTPUT_DIM
 from common.utils import get_weight_list
 from common.hessian import unwrap_hessian_pytree
 
@@ -111,6 +111,8 @@ class DyTV2Variant:
 
     def create_model(self, key, depth, width, act_fn, **kwargs):
         init_alpha = kwargs.get("init_alpha", 0.5)
+        input_dim = kwargs.get("input_dim", _DEFAULT_INPUT_DIM)
+        output_dim = kwargs.get("output_dim", _DEFAULT_OUTPUT_DIM)
 
         # Store noise config on the variant instance
         self.activity_noise = kwargs.get("activity_noise", 0.0)
@@ -118,8 +120,8 @@ class DyTV2Variant:
         self._noise_key = noise_key
 
         return FCResNetDyT_v2(
-            key=key, in_dim=INPUT_DIM, width=width, depth=depth,
-            out_dim=OUTPUT_DIM, act_fn=act_fn, init_alpha=init_alpha,
+            key=key, in_dim=input_dim, width=width, depth=depth,
+            out_dim=output_dim, act_fn=act_fn, init_alpha=init_alpha,
         )
 
     def init_activities(self, model, x_batch):

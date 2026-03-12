@@ -44,6 +44,7 @@ def run_single(cfg):
 
             model = variant.create_model(
                 key, depth=depth, width=cfg.width, act_fn=act_fn,
+                input_dim=cfg.input_dim, output_dim=cfg.output_dim,
                 init_alpha=cfg.init_alpha,
                 activity_noise=cfg.activity_noise,
             )
@@ -59,6 +60,7 @@ def run_single(cfg):
                 n_train_iters=cfg.n_train_iters,
                 test_every=cfg.test_every,
                 act_fn=act_fn,
+                dataset=cfg.dataset,
                 track_weight_updates=cfg.track_weight_updates,
                 track_activity_norms=cfg.track_activity_norms,
                 track_grad_norms=cfg.track_grad_norms,
@@ -105,6 +107,10 @@ def run_single(cfg):
 def main():
     parser = argparse.ArgumentParser(
         description="Run unified PC training experiments"
+    )
+    parser.add_argument(
+        "--dataset", choices=["MNIST", "CIFAR10"], default=None,
+        help="Dataset to train on (default: MNIST)",
     )
     parser.add_argument(
         "--variant", choices=ALL_VARIANTS, nargs="+",
@@ -180,6 +186,8 @@ def main():
 
     for variant_name in args.variant:
         overrides = {}
+        if args.dataset:
+            overrides["dataset"] = args.dataset
         if args.depths:
             overrides["depths"] = args.depths
         if args.act_fns:
@@ -222,6 +230,7 @@ def main():
         cfg = ExperimentConfig.from_variant(variant_name, **overrides)
         print(f"\n{'='*60}")
         print(f"Variant: {variant_name}")
+        print(f"Dataset: {cfg.dataset} (input_dim={cfg.input_dim})")
         print(f"Depths: {cfg.depths}")
         print(f"Activity LR: {cfg.activity_lr}, Param LR: {cfg.param_lr}")
         print(f"Iterations: {cfg.n_train_iters}")

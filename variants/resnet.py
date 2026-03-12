@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import jpc
 import equinox as eqx
 
-from config import INPUT_DIM, OUTPUT_DIM
+from config import INPUT_DIM as _DEFAULT_INPUT_DIM, OUTPUT_DIM as _DEFAULT_OUTPUT_DIM
 from common.utils import get_weight_list
 from common.hessian import unwrap_hessian_pytree
 
@@ -22,9 +22,11 @@ class ResNetVariant:
         return False
 
     def create_model(self, key, depth, width, act_fn, **kwargs):
+        input_dim = kwargs.get("input_dim", _DEFAULT_INPUT_DIM)
+        output_dim = kwargs.get("output_dim", _DEFAULT_OUTPUT_DIM)
         model = jpc.make_mlp(
-            key=key, input_dim=INPUT_DIM, width=width, depth=depth,
-            output_dim=OUTPUT_DIM, act_fn=act_fn, use_bias=False,
+            key=key, input_dim=input_dim, width=width, depth=depth,
+            output_dim=output_dim, act_fn=act_fn, use_bias=False,
             param_type="sp",
         )
         skip_model = jpc.make_skip_model(depth)
