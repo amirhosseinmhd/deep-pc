@@ -2,6 +2,7 @@
 
 import numpy as np
 import jax.numpy as jnp
+from jax import vmap
 import jpc
 import optax
 
@@ -26,6 +27,8 @@ def train_and_record(
     track_grad_norms=True,
     track_layer_energy=True,
     inference_multiplier=1.0,
+    activity_init="ffwd",
+    param_optim_type="adam",
     use_wandb=False,
 ):
     """Train a PCN and record all metrics in a single pass.
@@ -49,7 +52,10 @@ def train_and_record(
     set_seed(seed)
 
     activity_optim = optax.sgd(activity_lr)
-    param_optim = optax.adam(param_lr)
+    if param_optim_type == "sgd":
+        param_optim = optax.sgd(param_lr)
+    else:
+        param_optim = optax.adam(param_lr, eps=1e-12)
     param_opt_state = param_optim.init(variant.get_optimizer_target(model))
 
     train_loader, test_loader = get_mnist_loaders(batch_size)
@@ -79,9 +85,8 @@ def train_and_record(
         activities, batch_stats, effective_model = variant.init_activities(
             model, img_batch
         )
-
-        train_loss = float(jpc.mse_loss(activities[-1], label_batch))
-        metrics.record_train_loss(train_loss)
+        if activity_init == "zeros":
+            activities = [jnp.zeros_like(a) for a in activities]
 
         # Record pre-inference activity norms
         if track_activity_norms:
@@ -108,6 +113,15 @@ def train_and_record(
             )
             activities = result["activities"]
             activity_opt_state = result["opt_state"]
+
+        preds = vmap(params_for_jpc[0][-1])(activities[-2])
+        train_loss = float(jpc.mse_loss(preds, label_batch))
+        metrics.record_train_loss(train_loss)
+        train_acc = float(
+            jnp.mean(
+                jnp.argmax(preds, axis=1) == jnp.argmax(label_batch, axis=1)
+            ) * 100
+        )
 
         # Record post-inference activity norms
         if track_activity_norms:
@@ -156,7 +170,7 @@ def train_and_record(
 
         # --- W&B step logging ---
         if use_wandb:
-            wb_metrics = {"train_loss": train_loss}
+            wb_metrics = {"train_loss": train_loss, "train_acc": train_acc}
 
             if track_weight_updates and metrics.weight_update_norms:
                 last_wu = metrics.weight_update_norms[-1]
@@ -197,7 +211,7 @@ def train_and_record(
             metrics.record_test(iter_num + 1, avg_acc)
             print(
                 f"  Iter {iter_num+1}, loss={train_loss:.4f}, "
-                f"test acc={avg_acc:.2f}"
+                f"train acc={train_acc:.2f}, test acc={avg_acc:.2f}"
             )
             if use_wandb:
                 log_step_metrics(iter_num, {

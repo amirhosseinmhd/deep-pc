@@ -27,17 +27,11 @@ WIDTH = 128
 # Training hyperparameters
 # ---------------------------------------------------------------------------
 SEED = 42
-ACTIVITY_LR = 1e-3
-PARAM_LR = 5e-3
-BATCH_SIZE = 64
-TEST_EVERY = 100
-N_TRAIN_ITERS = 2700
-
-# ---------------------------------------------------------------------------
-# Experiment grid
-# ---------------------------------------------------------------------------
-DEPTHS = [5, 10, 20, 40]
-ACT_FNS = ["relu"]
+ACTIVITY_LR = 5e-1
+PARAM_LR = 1e-3
+BATCH_SIZE = 128
+TEST_EVERY = 50
+N_TRAIN_ITERS = 10000
 
 # ---------------------------------------------------------------------------
 # Condition number experiment
@@ -53,15 +47,17 @@ VARIANT_BF = "bf"
 VARIANT_BF_V2 = "bf_v2"
 VARIANT_DYT = "dyt"
 VARIANT_DYT_V2 = "dyt_v2"
+VARIANT_MUPC = "mupc"
 
 ALL_VARIANTS = [
     VARIANT_BASELINE, VARIANT_RESNET, VARIANT_BF,
     VARIANT_BF_V2, VARIANT_DYT, VARIANT_DYT_V2,
+    VARIANT_MUPC,
 ]
 
 
 # ---------------------------------------------------------------------------
-# Experiment configuration dataclass
+# Experiment configuration dataclass.  
 # ---------------------------------------------------------------------------
 @dataclass
 class ExperimentConfig:
@@ -74,7 +70,7 @@ class ExperimentConfig:
     input_dim: int = INPUT_DIM
     output_dim: int = OUTPUT_DIM
     width: int = WIDTH
-    depths: List[int] = field(default_factory=lambda: [5, 10, 20, 40])
+    depths: List[int] = field(default_factory=lambda: [4])
     act_fns: List[str] = field(default_factory=lambda: ["relu"])
 
     # Training
@@ -84,7 +80,9 @@ class ExperimentConfig:
     batch_size: int = BATCH_SIZE
     n_train_iters: int = N_TRAIN_ITERS
     test_every: int = TEST_EVERY
-    inference_multiplier: float = 1.0
+    inference_multiplier: float = 4.0
+    activity_init: str = "ffwd"  # "ffwd" or "zeros"
+    param_optim_type: str = "adam"  # "adam" or "sgd"
 
     # Metrics
     track_weight_updates: bool = True
@@ -102,6 +100,7 @@ class ExperimentConfig:
     use_wandb: bool = True
     wandb_project: str = "pcn-experiments"
     wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
 
     # Output
     results_dir: Optional[str] = None

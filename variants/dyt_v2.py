@@ -1,4 +1,4 @@
-"""Dynamic Tanh v2 (DyT-v2) — DyT wraps linear only, skip added after."""
+"""Dynamic Tanh v2 (DyT-v2) — DyT wraps linear only, skip handled by jpc."""
 
 import jax
 import jax.numpy as jnp
@@ -15,22 +15,35 @@ from config import INPUT_DIM, OUTPUT_DIM
 from common.utils import get_weight_list
 from common.hessian import unwrap_hessian_pytree
 
-# Reuse DyTLayer, InputLayer, OutputLayer from dyt (identical)
-from variants.dyt import DyTLayer, InputLayer, OutputLayer
+# Reuse DyTLayer and InputLayer from dyt
+from variants.dyt import DyTLayer, InputLayer
 
 
 # ============================================================================
-# v2 Hidden layer — DyT wraps linear only, skip after
+# v2 Output layer — act_fn -> Linear (no DyT)
+# ============================================================================
+class OutputLayerV2(eqx.Module):
+    """Output layer v2: act_fn -> Linear, no DyT."""
+    act_fn: Callable = eqx.field(static=True)
+    linear: nn.Linear
+
+    def __call__(self, x):
+        h = self.act_fn(x)
+        return self.linear(h)
+
+
+# ============================================================================
+# v2 Hidden layer — DyT wraps linear only, NO skip (skip handled by jpc)
 # ============================================================================
 class HiddenLayerDyT_v2(eqx.Module):
-    """Hidden layer v2: act_fn -> DyT(linear(x)) + skip."""
+    """Hidden layer v2: act_fn -> DyT(linear(x)), no skip."""
     act_fn: Callable = eqx.field(static=True)
     dyt: DyTLayer
     linear: nn.Linear
 
     def __call__(self, x):
         h = self.act_fn(x)
-        h = self.dyt(self.linear(h)) + x
+        h = self.dyt(self.linear(h))
         return h
 
 
@@ -66,16 +79,18 @@ class FCResNetDyT_v2(eqx.Module):
                 linear=nn.Linear(width, width, use_bias=False, key=keys[i]),
             ))
 
-        self.layers.append(OutputLayer(
+        self.layers.append(OutputLayerV2(
             act_fn=act,
-            dyt=DyTLayer(width, init_alpha=init_alpha,
-                         use_dyt=dyt_mask.get(depth - 1, True)),
             linear=nn.Linear(width, out_dim, use_bias=False, key=keys[-1]),
         ))
 
     def __call__(self, x):
-        for f in self.layers:
-            x = f(x)
+        """Forward pass (for evaluation). Manually applies skip connections."""
+        for i, f in enumerate(self.layers):
+            if 1 <= i <= len(self.layers) - 2:
+                x = f(x) + x
+            else:
+                x = f(x)
         return x
 
     def __len__(self):
@@ -89,7 +104,7 @@ class FCResNetDyT_v2(eqx.Module):
 # Variant implementation
 # ============================================================================
 class DyTV2Variant:
-    """DyT v2: DyT wraps linear only, skip added after."""
+    """DyT v2: DyT wraps linear only, skip handled by jpc."""
 
     @property
     def name(self):
@@ -101,52 +116,62 @@ class DyTV2Variant:
 
     def create_model(self, key, depth, width, act_fn, **kwargs):
         init_alpha = kwargs.get("init_alpha", 0.5)
-        return FCResNetDyT_v2(
+        model = FCResNetDyT_v2(
             key=key, in_dim=INPUT_DIM, width=width, depth=depth,
             out_dim=OUTPUT_DIM, act_fn=act_fn, init_alpha=init_alpha,
         )
+        skip_model = jpc.make_skip_model(depth)
+        return {"model": model, "skip_model": skip_model}
 
-    def init_activities(self, model, x_batch):
-        activities = []
-        h = x_batch
-        for layer in model.layers:
-            h = vmap(layer)(h)
-            activities.append(h)
-        return activities, None, model
+    def init_activities(self, bundle, x_batch):
+        activities = jpc.init_activities_with_ffwd(
+            model=bundle["model"].layers, input=x_batch,
+            skip_model=bundle["skip_model"], param_type="sp",
+        )
+        return activities, None, bundle
 
-    def get_params_for_jpc(self, model):
-        return (model.layers, None)
+    def get_params_for_jpc(self, bundle):
+        return (bundle["model"].layers, bundle["skip_model"])
 
     def get_param_type(self):
         return "sp"
 
-    def get_optimizer_target(self, model):
-        return (eqx.filter(model.layers, eqx.is_array), None)
+    def get_optimizer_target(self, bundle):
+        return (eqx.filter(bundle["model"].layers, eqx.is_array),
+                bundle["skip_model"])
 
-    def post_learning_step(self, model, result, batch_stats):
+    def post_learning_step(self, bundle, result, batch_stats):
         updated_layers = result["model"]
-        return eqx.tree_at(lambda m: m.layers, model, updated_layers)
+        updated_model = eqx.tree_at(
+            lambda m: m.layers, bundle["model"], updated_layers
+        )
+        return {
+            "model": updated_model,
+            "skip_model": result["skip_model"],
+        }
 
-    def evaluate(self, model, test_loader):
+    def evaluate(self, bundle, test_loader):
         avg_acc = 0.0
         for _, (img_batch, label_batch) in enumerate(test_loader):
             img_batch, label_batch = img_batch.numpy(), label_batch.numpy()
-            preds = vmap(model)(img_batch)
-            acc = float(
-                jnp.mean(
-                    jnp.argmax(preds, axis=1) == jnp.argmax(label_batch, axis=1)
-                ) * 100
+            _, test_acc = jpc.test_discriminative_pc(
+                model=bundle["model"].layers, output=label_batch,
+                input=img_batch, skip_model=bundle["skip_model"],
+                param_type="sp",
             )
-            avg_acc += acc
+            avg_acc += float(test_acc)
         return avg_acc / len(test_loader)
 
-    def get_weight_arrays(self, model):
-        return get_weight_list(model)
+    def get_weight_arrays(self, bundle):
+        return get_weight_list(bundle["model"])
 
-    def compute_condition_number(self, model, x, y):
-        activities, _, _ = self.init_activities(model, x)
+    def compute_condition_number(self, bundle, x, y):
+        activities = jpc.init_activities_with_ffwd(
+            model=bundle["model"].layers, input=x,
+            skip_model=bundle["skip_model"], param_type="sp",
+        )
         hessian_pytree = jax.hessian(jpc.pc_energy_fn, argnums=1)(
-            (model.layers, None), activities, y,
+            (bundle["model"].layers, bundle["skip_model"]), activities, y,
             x=x, param_type="sp",
         )
         H = unwrap_hessian_pytree(hessian_pytree, activities)
