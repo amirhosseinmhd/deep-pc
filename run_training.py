@@ -16,9 +16,10 @@ import argparse
 import numpy as np
 import jax.random as jr
 
-from config import ExperimentConfig, ALL_VARIANTS
+from config import ExperimentConfig, ALL_VARIANTS, VARIANT_REC_LRA
 from variants import get_variant
 from training.trainer import train_and_record
+from training.rec_lra_trainer import train_rec_lra
 from common.data import set_seed
 from common.utils import ensure_dir
 from plotting.plots import generate_all_plots
@@ -47,29 +48,55 @@ def run_single(cfg):
                 input_dim=cfg.input_dim, output_dim=cfg.output_dim,
                 init_alpha=cfg.init_alpha,
                 activity_noise=cfg.activity_noise,
+                forward_skip_every=cfg.forward_skip_every,
+                error_skip_every=cfg.error_skip_every,
             )
 
-            res = train_and_record(
-                variant=variant,
-                model=model,
-                depth=depth,
-                seed=cfg.seed,
-                activity_lr=cfg.activity_lr,
-                param_lr=cfg.param_lr,
-                batch_size=cfg.batch_size,
-                n_train_iters=cfg.n_train_iters,
-                test_every=cfg.test_every,
-                act_fn=act_fn,
-                dataset=cfg.dataset,
-                track_weight_updates=cfg.track_weight_updates,
-                track_activity_norms=cfg.track_activity_norms,
-                track_grad_norms=cfg.track_grad_norms,
-                track_layer_energy=cfg.track_layer_energy,
-                inference_multiplier=cfg.inference_multiplier,
-                activity_init=cfg.activity_init,
-                param_optim_type=cfg.param_optim_type,
-                use_wandb=use_wandb,
-            )
+            if cfg.variant == VARIANT_REC_LRA:
+                res = train_rec_lra(
+                    variant=variant,
+                    model=model,
+                    depth=depth,
+                    seed=cfg.seed,
+                    param_lr=cfg.param_lr,
+                    e_lr=cfg.e_lr,
+                    batch_size=cfg.batch_size,
+                    n_train_iters=cfg.n_train_iters,
+                    test_every=cfg.test_every,
+                    act_fn=act_fn,
+                    dataset=cfg.dataset,
+                    beta=cfg.beta,
+                    gamma_E=cfg.gamma_E,
+                    rec_lra_optim=cfg.rec_lra_optim,
+                    rec_lra_loss=cfg.rec_lra_loss,
+                    track_weight_updates=cfg.track_weight_updates,
+                    track_activity_norms=cfg.track_activity_norms,
+                    track_grad_norms=cfg.track_grad_norms,
+                    track_layer_energy=cfg.track_layer_energy,
+                    use_wandb=use_wandb,
+                )
+            else:
+                res = train_and_record(
+                    variant=variant,
+                    model=model,
+                    depth=depth,
+                    seed=cfg.seed,
+                    activity_lr=cfg.activity_lr,
+                    param_lr=cfg.param_lr,
+                    batch_size=cfg.batch_size,
+                    n_train_iters=cfg.n_train_iters,
+                    test_every=cfg.test_every,
+                    act_fn=act_fn,
+                    dataset=cfg.dataset,
+                    track_weight_updates=cfg.track_weight_updates,
+                    track_activity_norms=cfg.track_activity_norms,
+                    track_grad_norms=cfg.track_grad_norms,
+                    track_layer_energy=cfg.track_layer_energy,
+                    inference_multiplier=cfg.inference_multiplier,
+                    activity_init=cfg.activity_init,
+                    param_optim_type=cfg.param_optim_type,
+                    use_wandb=use_wandb,
+                )
             depth_results[depth] = res
 
             # Save all raw metrics (.npy — cheap, useful for offline analysis)
@@ -165,6 +192,35 @@ def main():
         "--activity-noise", type=float, default=None,
         help="Noise scale for activity init (dyt_v2 experiment, default: 0.0)",
     )
+    # rec-LRA arguments
+    parser.add_argument(
+        "--forward-skip-every", type=int, default=None,
+        help="Forward skip connection interval (rec-LRA, default: 2)",
+    )
+    parser.add_argument(
+        "--error-skip-every", type=int, default=None,
+        help="Error skip connection interval (rec-LRA, default: 2)",
+    )
+    parser.add_argument(
+        "--beta", type=float, default=None,
+        help="Target nudging strength (rec-LRA, default: 0.1)",
+    )
+    parser.add_argument(
+        "--gamma-e", type=float, default=None,
+        help="E matrix learning rate scale in Hebbian rule (rec-LRA, default: 0.01)",
+    )
+    parser.add_argument(
+        "--e-lr", type=float, default=None,
+        help="Learning rate for E matrices (rec-LRA, default: 1e-3)",
+    )
+    parser.add_argument(
+        "--rec-lra-optim", choices=["sgd", "adam"], default=None,
+        help="Optimizer for rec-LRA Hebbian updates (default: sgd)",
+    )
+    parser.add_argument(
+        "--rec-lra-loss", choices=["mse", "ce"], default=None,
+        help="Loss function for rec-LRA (default: mse)",
+    )
     # W&B arguments
     parser.add_argument(
         "--no-wandb", action="store_true",
@@ -218,6 +274,20 @@ def main():
             overrides["param_optim_type"] = args.param_optim
         if args.activity_noise is not None:
             overrides["activity_noise"] = args.activity_noise
+        if args.forward_skip_every is not None:
+            overrides["forward_skip_every"] = args.forward_skip_every
+        if args.error_skip_every is not None:
+            overrides["error_skip_every"] = args.error_skip_every
+        if args.beta is not None:
+            overrides["beta"] = args.beta
+        if args.gamma_e is not None:
+            overrides["gamma_E"] = args.gamma_e
+        if args.e_lr is not None:
+            overrides["e_lr"] = args.e_lr
+        if args.rec_lra_optim is not None:
+            overrides["rec_lra_optim"] = args.rec_lra_optim
+        if args.rec_lra_loss is not None:
+            overrides["rec_lra_loss"] = args.rec_lra_loss
         if args.no_wandb:
             overrides["use_wandb"] = False
         if args.wandb_project:
