@@ -34,6 +34,7 @@ def train_rec_lra(
     gamma_E=0.01,
     rec_lra_optim="sgd",
     rec_lra_loss="mse",
+    rec_lra_e_update="hebbian",
     track_weight_updates=True,
     track_activity_norms=True,
     track_grad_norms=True,
@@ -138,10 +139,16 @@ def train_rec_lra(
                     layer_energies.append(0.0)
             metrics.energy_per_layer.append(layer_energies)
 
-        # === Step 3: Compute Hebbian updates (COMPUTEUPDATES) ===
+        # === Step 3: Compute updates (COMPUTEUPDATES) ===
         delta_W, delta_E = variant.compute_hebbian_updates(
             model, z, e, d, img_batch
         )
+
+        # Variant 2 (rLRA-dx): override E updates with true gradient
+        if rec_lra_e_update == "grad":
+            delta_E = variant.compute_grad_E_updates(
+                model, z, h, label_batch, beta
+            )
 
         # Record "gradient" norms (Hebbian delta norms)
         if track_grad_norms:

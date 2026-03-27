@@ -69,6 +69,7 @@ def run_single(cfg):
                     gamma_E=cfg.gamma_E,
                     rec_lra_optim=cfg.rec_lra_optim,
                     rec_lra_loss=cfg.rec_lra_loss,
+                    rec_lra_e_update=cfg.rec_lra_e_update,
                     track_weight_updates=cfg.track_weight_updates,
                     track_activity_norms=cfg.track_activity_norms,
                     track_grad_norms=cfg.track_grad_norms,
@@ -221,6 +222,10 @@ def main():
         "--rec-lra-loss", choices=["mse", "ce"], default=None,
         help="Loss function for rec-LRA (default: mse)",
     )
+    parser.add_argument(
+        "--rec-lra-e-update", choices=["hebbian", "grad"], default=None,
+        help="E update rule: 'hebbian' (Eq.6, default) or 'grad' (rLRA-dx, true gradient)",
+    )
     # W&B arguments
     parser.add_argument(
         "--no-wandb", action="store_true",
@@ -288,6 +293,8 @@ def main():
             overrides["rec_lra_optim"] = args.rec_lra_optim
         if args.rec_lra_loss is not None:
             overrides["rec_lra_loss"] = args.rec_lra_loss
+        if args.rec_lra_e_update is not None:
+            overrides["rec_lra_e_update"] = args.rec_lra_e_update
         if args.no_wandb:
             overrides["use_wandb"] = False
         if args.wandb_project:

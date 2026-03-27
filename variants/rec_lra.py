@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import vmap
+from functools import partial
 import jpc
 import equinox as eqx
 import equinox.nn as nn
@@ -217,6 +218,71 @@ class RecLRAVariant:
             delta_E[l] = dE
 
         return delta_W, delta_E
+
+    def compute_grad_E_updates(self, bundle, z, h, y_batch, beta):
+        """Compute gradient-based E updates (Variant 2 / rLRA-dx).
+
+        Computes dD/dE where D = sum_l ||e_l||^2 using JAX autodiff.
+        Unlike the Hebbian rule (Eq. 6), this includes activation function
+        derivatives, making it mathematically precise but biologically
+        implausible. See paper appendix: "rLRA, dx" variant.
+
+        W updates remain Hebbian — only E updates change.
+        """
+        E_matrices = bundle["E"]
+        m = bundle["error_skip_every"]
+        act_fn = bundle["act_fn"]
+        L = bundle["depth"]
+
+        # Collect non-None E matrices and their indices
+        active_indices = [l for l in range(L) if E_matrices[l] is not None]
+        E_active = [E_matrices[l] for l in active_indices]
+
+        if not E_active:
+            return [None] * L
+
+        def discrepancy_fn(E_active_list):
+            # Reconstruct full E list from active subset
+            E_full = [None] * L
+            for idx, l in enumerate(active_indices):
+                E_full[l] = E_active_list[idx]
+
+            # Recompute backward sweep (mirrors compute_targets_and_errors)
+            e = [None] * L
+            e[L - 1] = z[L - 1] - y_batch
+
+            for l in range(L - 2, -1, -1):
+                if l == 0:
+                    d_l = jnp.zeros_like(z[l])
+                elif E_full[l] is not None:
+                    if m > 0 and l % m == 0:
+                        d_l = e[L - 1] @ E_full[l].T
+                    else:
+                        d_l = e[l + 1] @ E_full[l].T
+                else:
+                    d_l = jnp.zeros_like(z[l])
+
+                if l < L - 1:
+                    y_l = vmap(act_fn)(h[l] - beta * d_l)
+                else:
+                    y_l = h[l] - beta * d_l
+
+                e[l] = z[l] - y_l
+
+            # Total discrepancy D = sum_l ||e_l||^2 averaged over batch
+            D = sum(
+                jnp.mean(jnp.sum(e[l] ** 2, axis=1))
+                for l in range(L) if e[l] is not None
+            )
+            return D
+
+        grad_E_active = jax.grad(discrepancy_fn)(E_active)
+
+        delta_E = [None] * L
+        for idx, l in enumerate(active_indices):
+            delta_E[l] = grad_E_active[idx]
+
+        return delta_E
 
     def apply_hebbian_updates(self, bundle, delta_W, delta_E, lr_W, lr_E):
         """Apply Hebbian updates to W and E matrices.

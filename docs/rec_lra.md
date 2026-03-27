@@ -119,6 +119,7 @@ The W update has the form of a classic Hebbian rule: the weight change is propor
 | `gamma_E` | `--gamma-e` | 0.1 | Scaling factor in the E update rule (Eq. 6). Controls E learning speed relative to displacement magnitude. |
 | `rec_lra_optim` | `--rec-lra-optim` | sgd | Optimizer: `sgd` (vanilla, paper-faithful) or `adam` (wraps Hebbian deltas as pseudo-gradients) |
 | `rec_lra_loss` | `--rec-lra-loss` | mse | Loss for reporting: `mse` or `ce` (cross-entropy). Note: the error signal `e_L = z_L - y` is always the raw difference regardless of this setting. |
+| `rec_lra_e_update` | `--rec-lra-e-update` | hebbian | E update rule: `hebbian` (Eq. 6, biologically plausible) or `grad` (rLRA-dx, true gradient via autodiff) |
 
 ### How the parameters interact
 
@@ -277,11 +278,25 @@ The model is a Python dict (not a single Equinox module):
 }
 ```
 
-## Planned: Variant 2 (Gradient-based E updates)
+## Variant 2: Gradient-based E updates (rLRA-dx)
 
-The current implementation (Variant 1) updates E with the Hebbian rule from Eq. 6. Variant 2 will instead compute the true gradient of the total discrepancy `D = sum(||e_l||^2)` with respect to E using JAX autodiff.
+The default (Variant 1) updates E with the Hebbian rule from Eq. 6: `ΔE = -γ · d · e^T`. Variant 2 ("rLRA-dx", from the paper's appendix) computes the true gradient `∂D/∂E` where `D = Σ||e_l||²`, using JAX autodiff. This includes activation function derivatives that the Hebbian rule drops, making it mathematically precise but biologically implausible.
 
-The hook point is `apply_hebbian_updates()` in `RecLRAVariant`. A subclass or config flag would override the E update portion to use `jax.grad(D, argnums=E)` instead of the Hebbian outer product, while keeping the Hebbian W updates unchanged.
+W updates remain Hebbian in both variants — only E updates differ.
+
+### Usage
+
+```bash
+# Variant 1: Hebbian E updates (default)
+python run_training.py --variant rec_lra --depths 5 --n-iters 1000 \
+    --act-fns tanh --param-lr 0.01 --no-wandb
+
+# Variant 2: Gradient-based E updates (rLRA-dx)
+python run_training.py --variant rec_lra --depths 5 --n-iters 1000 \
+    --act-fns tanh --param-lr 0.01 --rec-lra-e-update grad --no-wandb
+```
+
+Note: `gamma_E` is not used in Variant 2 since the gradient is already correctly scaled. The E learning rate (`--e-lr`) still controls the step size.
 
 ## Reference
 

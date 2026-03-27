@@ -105,11 +105,12 @@ class ExperimentConfig:
     # rec-LRA specific
     forward_skip_every: int = 2
     error_skip_every: int = 2
-    beta: float = 0.5
+    beta: float = 1
     gamma_E: float = 0.1
     e_lr: float = 1e-2
     rec_lra_optim: str = "sgd"
     rec_lra_loss: str = "mse"
+    rec_lra_e_update: str = "hebbian"  # "hebbian" (Eq.6) or "grad" (rLRA-dx)
 
     # Condition number experiment
     cond_width: int = COND_WIDTH
