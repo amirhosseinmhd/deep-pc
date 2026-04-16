@@ -75,12 +75,8 @@ def train_rec_lra(
         w_optim = optax.adam(param_lr, eps=1e-12)
         e_optim = optax.adam(e_lr, eps=1e-12)
 
-        # Initialize per-layer optimizer states for W
-        w_opt_state = []
-        for l in range(len(model["model"])):
-            layer = model["model"][l]
-            linear = layer.layers[1]
-            w_opt_state.append(w_optim.init(linear.weight))
+        # Initialize per-layer optimizer states for W (variant handles layer structure)
+        w_opt_state = variant.init_w_optim_states(model, w_optim)
 
         # Initialize per-layer optimizer states for E
         e_opt_state = [None] * len(model["E"])

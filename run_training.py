@@ -16,7 +16,7 @@ import argparse
 import numpy as np
 import jax.random as jr
 
-from config import ExperimentConfig, ALL_VARIANTS, VARIANT_REC_LRA
+from config import ExperimentConfig, ALL_VARIANTS, VARIANT_REC_LRA, VARIANT_CNN_REC_LRA
 from variants import get_variant
 from training.trainer import train_and_record
 from training.rec_lra_trainer import train_rec_lra
@@ -43,6 +43,16 @@ def run_single(cfg):
             if use_wandb:
                 init_wandb(cfg, depth, act_fn)
 
+            extra_create_kwargs = {}
+            if cfg.variant == VARIANT_CNN_REC_LRA:
+                extra_create_kwargs = dict(
+                    cnn_channels=cfg.cnn_channels,
+                    cnn_fc_width=cfg.cnn_fc_width,
+                    n_fc_hidden=cfg.n_fc_hidden,
+                    kernel_size=cfg.kernel_size,
+                    input_shape=(3, 32, 32),
+                )
+
             model = variant.create_model(
                 key, depth=depth, width=cfg.width, act_fn=act_fn,
                 input_dim=cfg.input_dim, output_dim=cfg.output_dim,
@@ -50,9 +60,10 @@ def run_single(cfg):
                 activity_noise=cfg.activity_noise,
                 forward_skip_every=cfg.forward_skip_every,
                 error_skip_every=cfg.error_skip_every,
+                **extra_create_kwargs,
             )
 
-            if cfg.variant == VARIANT_REC_LRA:
+            if cfg.variant in (VARIANT_REC_LRA, VARIANT_CNN_REC_LRA):
                 res = train_rec_lra(
                     variant=variant,
                     model=model,
@@ -226,6 +237,27 @@ def main():
         "--rec-lra-e-update", choices=["hebbian", "grad"], default=None,
         help="E update rule: 'hebbian' (Eq.6, default) or 'grad' (rLRA-dx, true gradient)",
     )
+    # CNN-rec-LRA arguments
+    parser.add_argument(
+        "--cnn-channels", type=int, nargs="+", default=None,
+        help="Output channels per conv layer for CNN-rLRA (default: [32, 64, 128])",
+    )
+    parser.add_argument(
+        "--cnn-fc-width", type=int, default=None,
+        help="FC hidden layer width for CNN-rLRA (default: 256)",
+    )
+    parser.add_argument(
+        "--kernel-size", type=int, default=None,
+        help="Conv kernel size for CNN-rLRA (default: 3)",
+    )
+    parser.add_argument(
+        "--n-fc-hidden", type=int, default=None,
+        help="Number of hidden FC layers for CNN-rLRA (default: 1)",
+    )
+    parser.add_argument(
+        "--test-every", type=int, default=None,
+        help="Evaluate on test set every N iterations (default: 1)",
+    )
     # W&B arguments
     parser.add_argument(
         "--no-wandb", action="store_true",
@@ -295,6 +327,16 @@ def main():
             overrides["rec_lra_loss"] = args.rec_lra_loss
         if args.rec_lra_e_update is not None:
             overrides["rec_lra_e_update"] = args.rec_lra_e_update
+        if args.cnn_channels:
+            overrides["cnn_channels"] = args.cnn_channels
+        if args.cnn_fc_width:
+            overrides["cnn_fc_width"] = args.cnn_fc_width
+        if args.kernel_size:
+            overrides["kernel_size"] = args.kernel_size
+        if args.n_fc_hidden is not None:
+            overrides["n_fc_hidden"] = args.n_fc_hidden
+        if args.test_every is not None:
+            overrides["test_every"] = args.test_every
         if args.no_wandb:
             overrides["use_wandb"] = False
         if args.wandb_project:

@@ -53,11 +53,13 @@ VARIANT_DYT_V2 = "dyt_v2"
 VARIANT_DYT_V3 = "dyt_v3"
 VARIANT_MUPC = "mupc"
 VARIANT_REC_LRA = "rec_lra"
+VARIANT_CNN_REC_LRA = "cnn_rec_lra"
 
 ALL_VARIANTS = [
     VARIANT_BASELINE, VARIANT_RESNET, VARIANT_BF,
     VARIANT_BF_V2, VARIANT_DYT, VARIANT_DYT_V2,
     VARIANT_DYT_V3, VARIANT_MUPC, VARIANT_REC_LRA,
+    VARIANT_CNN_REC_LRA,
 ]
 
 
@@ -105,12 +107,20 @@ class ExperimentConfig:
     # rec-LRA specific
     forward_skip_every: int = 2
     error_skip_every: int = 2
+
     beta: float = 1
     gamma_E: float = 0.1
-    e_lr: float = 1e-2
-    rec_lra_optim: str = "sgd"
+    e_lr: float = 1e-3
+    rec_lra_optim: str = "adam"
     rec_lra_loss: str = "mse"
-    rec_lra_e_update: str = "hebbian"  # "hebbian" (Eq.6) or "grad" (rLRA-dx)
+    rec_lra_e_update: str = "grad"  # "hebbian" (Eq.6) or "grad" (rLRA-dx)
+
+    # CNN-rec-LRA specific
+    # Default: 7 conv + 1 FC hidden + output = 9 total layers
+    cnn_channels: List[int] = field(default_factory=lambda: [32, 64, 64, 128, 128, 256, 256])
+    cnn_fc_width: int = 512
+    n_fc_hidden: int = 1
+    kernel_size: int = 3
 
     # Condition number experiment
     cond_width: int = COND_WIDTH
