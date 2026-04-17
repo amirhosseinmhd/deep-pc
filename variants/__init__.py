@@ -4,7 +4,7 @@ from config import (
     VARIANT_BASELINE, VARIANT_RESNET, VARIANT_BF,
     VARIANT_BF_V2, VARIANT_DYT, VARIANT_DYT_V2,
     VARIANT_DYT_V3, VARIANT_MUPC, VARIANT_REC_LRA,
-    VARIANT_CNN_REC_LRA,
+    VARIANT_CNN_REC_LRA, VARIANT_RES_ERROR_NET,
 )
 from variants.baseline import BaselineVariant
 from variants.resnet import ResNetVariant
@@ -16,6 +16,7 @@ from variants.dyt_v3 import DyTV3Variant
 from variants.mupc import MuPCVariant
 from variants.rec_lra import RecLRAVariant
 from variants.cnn_rec_lra import CNNRecLRAVariant
+from variants.res_error_net import ResErrorNetVariant
 
 VARIANT_REGISTRY = {
     VARIANT_BASELINE: BaselineVariant,
@@ -28,6 +29,7 @@ VARIANT_REGISTRY = {
     VARIANT_MUPC: MuPCVariant,
     VARIANT_REC_LRA: RecLRAVariant,
     VARIANT_CNN_REC_LRA: CNNRecLRAVariant,
+    VARIANT_RES_ERROR_NET: ResErrorNetVariant,
 }
 
 
