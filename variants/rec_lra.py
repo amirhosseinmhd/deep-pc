@@ -21,6 +21,7 @@ import equinox.nn as nn
 
 from config import INPUT_DIM as _DEFAULT_INPUT_DIM, OUTPUT_DIM as _DEFAULT_OUTPUT_DIM
 from common.utils import get_weight_list
+from variants.rec_lra_common import alpha_mix_error
 
 
 class RecLRAVariant:
@@ -39,6 +40,11 @@ class RecLRAVariant:
         output_dim = kwargs.get("output_dim", _DEFAULT_OUTPUT_DIM)
         forward_skip_every = kwargs.get("forward_skip_every", 2)
         error_skip_every = kwargs.get("error_skip_every", 2)
+        # Paper p.15: convex L1+L2 error neurons. α=0.19 for skip-error
+        # endpoints, α=0.24 for adjacent endpoints. The output layer is
+        # treated as a skip endpoint.
+        alpha_e_skip = kwargs.get("alpha_e_skip", 0.19)
+        alpha_e_adj = kwargs.get("alpha_e_adj", 0.24)
 
         key, subkey = jr.split(key)
         model = jpc.make_mlp(
@@ -55,23 +61,24 @@ class RecLRAVariant:
             _out = output_dim if (i + 1) == depth else width
             dims.append(_out)
 
+        # Paper p.16: forward and error weights initialised from a unit
+        # Gaussian (Xavier and orthogonal "yielded unsatisfactory
+        # performance"). Replace existing forward weights to match.
+        model = self._reinit_unit_gaussian(model, key)
+        key, _ = jr.split(key)
+
         # Create E matrices for error transmission.
         # E[l] computes d[l] in the backward sweep (l from L-2 down to 1).
         # E[0] = None (no error to input proxy layer).
-        # E matrices exist for l=1..L-2 so all hidden layers receive error.
-        # Hebbian E UPDATES are only for l > 1 (paper guard), but E[1] still
-        # exists as a connection so layer 1 gets a nonzero error signal.
         E = [None] * depth
-        for l in range(1, depth - 1):  # l from 1 to L-2
+        for l in range(1, depth - 1):
             key, subkey = jr.split(key)
             if error_skip_every > 0 and l % error_skip_every == 0:
-                # Error skip from output: shape (dims[l], dims[L-1])
                 fan_in = dims[-1]
-                E[l] = jr.normal(subkey, (dims[l], fan_in)) / jnp.sqrt(fan_in)
+                E[l] = jr.normal(subkey, (dims[l], fan_in))
             else:
-                # Adjacent error: shape (dims[l], dims[l+1])
                 fan_in = dims[l + 1]
-                E[l] = jr.normal(subkey, (dims[l], fan_in)) / jnp.sqrt(fan_in)
+                E[l] = jr.normal(subkey, (dims[l], fan_in))
 
         return {
             "model": model,
@@ -80,7 +87,29 @@ class RecLRAVariant:
             "error_skip_every": error_skip_every,
             "act_fn": act_fn_callable,
             "depth": depth,
+            "alpha_e_skip": alpha_e_skip,
+            "alpha_e_adj": alpha_e_adj,
         }
+
+    @staticmethod
+    def _reinit_unit_gaussian(model, key):
+        """Re-initialise every hidden Linear in the MLP Sequential to N(0, 1).
+
+        The output read-out is left at the equinox default (1/√fan_in) so
+        MSE on one-hot targets stays well-scaled.
+        """
+        new_layers = list(model)
+        L = len(new_layers)
+        for l in range(L - 1):  # skip output
+            seq = new_layers[l]
+            linear = seq.layers[1]
+            key, sub = jr.split(key)
+            new_w = jr.normal(sub, linear.weight.shape)
+            new_linear = eqx.tree_at(lambda lin: lin.weight, linear, new_w)
+            new_layers[l] = eqx.tree_at(
+                lambda s: s.layers[1], seq, new_linear
+            )
+        return new_layers
 
     def forward_pass(self, bundle, x_batch):
         """Run the forward pass (RUNMODEL from Algorithm 1).
@@ -131,36 +160,34 @@ class RecLRAVariant:
         m = bundle["error_skip_every"]
         act_fn = bundle["act_fn"]
         L = bundle["depth"]
+        alpha_skip = bundle.get("alpha_e_skip", 0.19)
+        alpha_adj = bundle.get("alpha_e_adj", 0.24)
 
         e = [None] * L
         d = [None] * L
 
-        # Output error
-        e[L - 1] = z[L - 1] - y_batch
+        # Output error: treat as a skip endpoint per the paper
+        e[L - 1] = alpha_mix_error(z[L - 1], y_batch, alpha_skip)
 
-        # Backward sweep: compute targets and errors for hidden layers
         for l in range(L - 2, -1, -1):
+            is_skip = (m > 0 and l % m == 0)
             if l == 0:
-                # No error connection to first layer
                 d[l] = jnp.zeros_like(z[l])
             elif E_matrices[l] is not None:
-                if m > 0 and l % m == 0:
-                    # Error skip from output: d_l = e_L @ E_{L->l}^T
+                if is_skip:
                     d[l] = e[L - 1] @ E_matrices[l].T
                 else:
-                    # Error from adjacent next layer: d_l = e_{l+1} @ E_{l+1->l}^T
                     d[l] = e[l + 1] @ E_matrices[l].T
             else:
                 d[l] = jnp.zeros_like(z[l])
 
-            # Target: y_l = phi(h_l - beta * d_l)
             if l < L - 1:
                 y_l = vmap(act_fn)(h[l] - beta * d[l])
             else:
                 y_l = h[l] - beta * d[l]
 
-            # Error: e_l = z_l - y_l
-            e[l] = z[l] - y_l
+            alpha_l = alpha_skip if is_skip else alpha_adj
+            e[l] = alpha_mix_error(z[l], y_l, alpha_l)
 
         return e, d
 
@@ -377,6 +404,14 @@ class RecLRAVariant:
 
     def get_weight_arrays(self, bundle):
         return get_weight_list(bundle["model"])
+
+    def init_w_optim_states(self, bundle, w_optim):
+        """Return per-layer Adam states for W matrices (MLP Sequential structure)."""
+        states = []
+        for layer in bundle["model"]:
+            linear = layer.layers[1]   # Sequential([Lambda(act_fn), Linear])
+            states.append(w_optim.init(linear.weight))
+        return states
 
     def get_E_arrays(self, bundle):
         """Return list of non-None E matrices for tracking."""

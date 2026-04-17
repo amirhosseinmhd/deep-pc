@@ -31,7 +31,7 @@ WIDTH = 128
 # ---------------------------------------------------------------------------
 SEED = 42
 ACTIVITY_LR = 5e-1
-PARAM_LR = 1e-3
+PARAM_LR = 1e-4
 BATCH_SIZE = 128
 TEST_EVERY = 1
 N_TRAIN_ITERS = 1000
@@ -54,12 +54,13 @@ VARIANT_DYT_V3 = "dyt_v3"
 VARIANT_MUPC = "mupc"
 VARIANT_REC_LRA = "rec_lra"
 VARIANT_CNN_REC_LRA = "cnn_rec_lra"
+VARIANT_RES_ERROR_NET = "res_error_net"
 
 ALL_VARIANTS = [
     VARIANT_BASELINE, VARIANT_RESNET, VARIANT_BF,
     VARIANT_BF_V2, VARIANT_DYT, VARIANT_DYT_V2,
     VARIANT_DYT_V3, VARIANT_MUPC, VARIANT_REC_LRA,
-    VARIANT_CNN_REC_LRA,
+    VARIANT_CNN_REC_LRA, VARIANT_RES_ERROR_NET,
 ]
 
 
@@ -104,16 +105,28 @@ class ExperimentConfig:
     init_alpha: float = 0.5
     activity_noise: float = 0.0
 
-    # rec-LRA specific
+    # rec-LRA specific (defaults from Ororbia & Mali 2023, p.15)
     forward_skip_every: int = 2
     error_skip_every: int = 2
 
-    beta: float = 1
-    gamma_E: float = 0.1
-    e_lr: float = 1e-3
-    rec_lra_optim: str = "adam"
+    beta: float = 0.1205
+    gamma_E: float = 0.1524
+    e_lr: float = 1e-4
+    rec_lra_optim: str = "adamw"
     rec_lra_loss: str = "mse"
-    rec_lra_e_update: str = "grad"  # "hebbian" (Eq.6) or "grad" (rLRA-dx)
+    rec_lra_e_update: str = "grad"   # "hebbian" (Eq.6) or "grad" (rLRA-dx)
+    # α=1.0 = pure L2/MSE error neurons. Paper uses 0.19/0.24 with
+    # softmax+CE; with raw MSE the sign(z-y) term dominates and stalls
+    # training. Pass --alpha-e-skip 0.19 --alpha-e-adj 0.24 to opt back in.
+    alpha_e_skip: float = 1.0
+    alpha_e_adj: float = 1.0
+    reproject_c: float = 1.0          # Gaussian-ball update radius
+    input_noise_sigma: float = 0.1
+    weight_decay: float = 1e-4
+    use_layer_norm: bool = True
+    # GCN+ZCA hurts in our raw-MSE setup (29.5% → 19.4% at 400 iters).
+    # Re-enable with --use-zca for paper-fidelity comparisons.
+    use_zca: bool = False
 
     # CNN-rec-LRA specific
     # Default: 7 conv + 1 FC hidden + output = 9 total layers
@@ -121,6 +134,19 @@ class ExperimentConfig:
     cnn_fc_width: int = 512
     n_fc_hidden: int = 1
     kernel_size: int = 3
+
+    # res-error-net specific
+    res_highway_every_k: int = 5
+    res_alpha: float = 0.1
+    res_inference_T: int = 100
+    res_inference_dt: float = 0.1
+    res_v_lr: float = 1e-4
+    res_v_update_rule: str = "state"   # "energy" or "state"
+    res_v_init_scale: float = 0.01
+    res_output_clamp: str = "hard"       # soft reserved for future
+    res_optim: str = "adamw"
+    res_loss: str = "mse"
+    res_init_scheme: str = "jpc_default"  # "jpc_default" or "unit_gaussian"
 
     # Condition number experiment
     cond_width: int = COND_WIDTH

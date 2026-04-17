@@ -16,10 +16,14 @@ import argparse
 import numpy as np
 import jax.random as jr
 
-from config import ExperimentConfig, ALL_VARIANTS, VARIANT_REC_LRA, VARIANT_CNN_REC_LRA
+from config import (
+    ExperimentConfig, ALL_VARIANTS,
+    VARIANT_REC_LRA, VARIANT_CNN_REC_LRA, VARIANT_RES_ERROR_NET,
+)
 from variants import get_variant
 from training.trainer import train_and_record
 from training.rec_lra_trainer import train_rec_lra
+from training.res_error_net_trainer import train_res_error_net
 from common.data import set_seed
 from common.utils import ensure_dir
 from plotting.plots import generate_all_plots
@@ -44,13 +48,25 @@ def run_single(cfg):
                 init_wandb(cfg, depth, act_fn)
 
             extra_create_kwargs = {}
-            if cfg.variant == VARIANT_CNN_REC_LRA:
+            if cfg.variant in (VARIANT_REC_LRA, VARIANT_CNN_REC_LRA):
                 extra_create_kwargs = dict(
+                    alpha_e_skip=cfg.alpha_e_skip,
+                    alpha_e_adj=cfg.alpha_e_adj,
+                )
+            if cfg.variant == VARIANT_CNN_REC_LRA:
+                extra_create_kwargs.update(dict(
                     cnn_channels=cfg.cnn_channels,
                     cnn_fc_width=cfg.cnn_fc_width,
                     n_fc_hidden=cfg.n_fc_hidden,
                     kernel_size=cfg.kernel_size,
                     input_shape=(3, 32, 32),
+                    use_layer_norm=cfg.use_layer_norm,
+                ))
+            if cfg.variant == VARIANT_RES_ERROR_NET:
+                extra_create_kwargs = dict(
+                    highway_every_k=cfg.res_highway_every_k,
+                    v_init_scale=cfg.res_v_init_scale,
+                    res_init_scheme=cfg.res_init_scheme,
                 )
 
             model = variant.create_model(
@@ -63,7 +79,36 @@ def run_single(cfg):
                 **extra_create_kwargs,
             )
 
-            if cfg.variant in (VARIANT_REC_LRA, VARIANT_CNN_REC_LRA):
+            if cfg.variant == VARIANT_RES_ERROR_NET:
+                res = train_res_error_net(
+                    variant=variant,
+                    model=model,
+                    depth=depth,
+                    seed=cfg.seed,
+                    param_lr=cfg.param_lr,
+                    v_lr=cfg.res_v_lr,
+                    batch_size=cfg.batch_size,
+                    n_train_iters=cfg.n_train_iters,
+                    test_every=cfg.test_every,
+                    act_fn=act_fn,
+                    dataset=cfg.dataset,
+                    alpha=cfg.res_alpha,
+                    inference_T=cfg.res_inference_T,
+                    inference_dt=cfg.res_inference_dt,
+                    v_update_rule=cfg.res_v_update_rule,
+                    optim_type=cfg.res_optim,
+                    loss_type=cfg.res_loss,
+                    reproject_c=cfg.reproject_c,
+                    input_noise_sigma=cfg.input_noise_sigma,
+                    weight_decay=cfg.weight_decay,
+                    use_zca=cfg.use_zca,
+                    track_weight_updates=cfg.track_weight_updates,
+                    track_activity_norms=cfg.track_activity_norms,
+                    track_grad_norms=cfg.track_grad_norms,
+                    track_layer_energy=cfg.track_layer_energy,
+                    use_wandb=use_wandb,
+                )
+            elif cfg.variant in (VARIANT_REC_LRA, VARIANT_CNN_REC_LRA):
                 res = train_rec_lra(
                     variant=variant,
                     model=model,
@@ -81,6 +126,10 @@ def run_single(cfg):
                     rec_lra_optim=cfg.rec_lra_optim,
                     rec_lra_loss=cfg.rec_lra_loss,
                     rec_lra_e_update=cfg.rec_lra_e_update,
+                    reproject_c=cfg.reproject_c,
+                    input_noise_sigma=cfg.input_noise_sigma,
+                    weight_decay=cfg.weight_decay,
+                    use_zca=cfg.use_zca,
                     track_weight_updates=cfg.track_weight_updates,
                     track_activity_norms=cfg.track_activity_norms,
                     track_grad_norms=cfg.track_grad_norms,
@@ -226,8 +275,36 @@ def main():
         help="Learning rate for E matrices (rec-LRA, default: 1e-3)",
     )
     parser.add_argument(
-        "--rec-lra-optim", choices=["sgd", "adam"], default=None,
-        help="Optimizer for rec-LRA Hebbian updates (default: sgd)",
+        "--rec-lra-optim", choices=["sgd", "adam", "adamw"], default=None,
+        help="Optimizer for rec-LRA Hebbian updates (default: adamw)",
+    )
+    parser.add_argument(
+        "--reproject-c", type=float, default=None,
+        help="Gaussian-ball radius for update re-projection. 0 disables (default: 1.0)",
+    )
+    parser.add_argument(
+        "--input-noise-sigma", type=float, default=None,
+        help="Stdev of Gaussian noise added to inputs. 0 disables (default: 0.1)",
+    )
+    parser.add_argument(
+        "--weight-decay", type=float, default=None,
+        help="AdamW weight decay (default: 1e-4)",
+    )
+    parser.add_argument(
+        "--alpha-e-skip", type=float, default=None,
+        help="α for skip-error endpoints (paper: 0.19; 1.0 = pure MSE)",
+    )
+    parser.add_argument(
+        "--alpha-e-adj", type=float, default=None,
+        help="α for adjacent-error endpoints (paper: 0.24; 1.0 = pure MSE)",
+    )
+    parser.add_argument(
+        "--no-layer-norm", action="store_true",
+        help="Disable LayerNorm in CNN (default: enabled)",
+    )
+    parser.add_argument(
+        "--use-zca", action="store_true",
+        help="Enable GCN+ZCA preprocessing on CIFAR-10 (default: disabled — hurts in raw-MSE setup)",
     )
     parser.add_argument(
         "--rec-lra-loss", choices=["mse", "ce"], default=None,
@@ -236,6 +313,48 @@ def main():
     parser.add_argument(
         "--rec-lra-e-update", choices=["hebbian", "grad"], default=None,
         help="E update rule: 'hebbian' (Eq.6, default) or 'grad' (rLRA-dx, true gradient)",
+    )
+    # res-error-net arguments
+    parser.add_argument(
+        "--res-highway-every-k", type=int, default=None,
+        help="Stride of V_{L->i} highways (res-error-net, default: 2)",
+    )
+    parser.add_argument(
+        "--res-alpha", type=float, default=None,
+        help="Global coupling α for V highways (res-error-net, default: 0.1)",
+    )
+    parser.add_argument(
+        "--res-inference-T", type=int, default=None,
+        help="Number of inference (Euler) steps per batch (res-error-net, default: 20)",
+    )
+    parser.add_argument(
+        "--res-inference-dt", type=float, default=None,
+        help="Euler step size for z dynamics (res-error-net, default: 0.1)",
+    )
+    parser.add_argument(
+        "--res-v-lr", type=float, default=None,
+        help="Learning rate for V highway matrices (res-error-net, default: 1e-4)",
+    )
+    parser.add_argument(
+        "--res-v-update-rule", choices=["energy", "state"], default=None,
+        help="V update rule: 'energy' (α·e^i·e^L^T, derived) or 'state' (α·z^i·e^L^T)",
+    )
+    parser.add_argument(
+        "--res-v-init-scale", type=float, default=None,
+        help="Init scale for V matrices (res-error-net, default: 0.01)",
+    )
+    parser.add_argument(
+        "--res-optim", choices=["sgd", "adam", "adamw"], default=None,
+        help="Optimizer for res-error-net (default: adamw)",
+    )
+    parser.add_argument(
+        "--res-loss", choices=["mse", "ce"], default=None,
+        help="Loss for res-error-net reporting (default: mse)",
+    )
+    parser.add_argument(
+        "--res-init-scheme", choices=["jpc_default", "unit_gaussian"], default=None,
+        help="Weight init for res-error-net. 'jpc_default' = 1/√fan_in (stable), "
+             "'unit_gaussian' = rec-LRA paper style (needs ZCA / small dt)",
     )
     # CNN-rec-LRA arguments
     parser.add_argument(
@@ -327,6 +446,40 @@ def main():
             overrides["rec_lra_loss"] = args.rec_lra_loss
         if args.rec_lra_e_update is not None:
             overrides["rec_lra_e_update"] = args.rec_lra_e_update
+        if args.reproject_c is not None:
+            overrides["reproject_c"] = args.reproject_c
+        if args.input_noise_sigma is not None:
+            overrides["input_noise_sigma"] = args.input_noise_sigma
+        if args.weight_decay is not None:
+            overrides["weight_decay"] = args.weight_decay
+        if args.alpha_e_skip is not None:
+            overrides["alpha_e_skip"] = args.alpha_e_skip
+        if args.alpha_e_adj is not None:
+            overrides["alpha_e_adj"] = args.alpha_e_adj
+        if args.no_layer_norm:
+            overrides["use_layer_norm"] = False
+        if args.use_zca:
+            overrides["use_zca"] = True
+        if args.res_highway_every_k is not None:
+            overrides["res_highway_every_k"] = args.res_highway_every_k
+        if args.res_alpha is not None:
+            overrides["res_alpha"] = args.res_alpha
+        if args.res_inference_T is not None:
+            overrides["res_inference_T"] = args.res_inference_T
+        if args.res_inference_dt is not None:
+            overrides["res_inference_dt"] = args.res_inference_dt
+        if args.res_v_lr is not None:
+            overrides["res_v_lr"] = args.res_v_lr
+        if args.res_v_update_rule is not None:
+            overrides["res_v_update_rule"] = args.res_v_update_rule
+        if args.res_v_init_scale is not None:
+            overrides["res_v_init_scale"] = args.res_v_init_scale
+        if args.res_optim is not None:
+            overrides["res_optim"] = args.res_optim
+        if args.res_loss is not None:
+            overrides["res_loss"] = args.res_loss
+        if args.res_init_scheme is not None:
+            overrides["res_init_scheme"] = args.res_init_scheme
         if args.cnn_channels:
             overrides["cnn_channels"] = args.cnn_channels
         if args.cnn_fc_width:

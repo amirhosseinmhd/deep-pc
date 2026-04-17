@@ -43,25 +43,22 @@ import numpy as np
 import jpc
 
 from config import OUTPUT_DIM as _DEFAULT_OUTPUT_DIM
+from variants.rec_lra_common import alpha_mix_error
 
 
-def _source_dim(l, n_conv, layer_shapes, flat_dims):
-    """Effective scalar dimension of e[l] when used as E-matrix source.
+def _adj_source_dim(l, n_conv, layer_shapes, flat_dims):
+    """Effective scalar dimension of e[l] when used as ADJACENT-E source.
 
-    For conv layers we spatially-average before multiplying by E, so the
-    effective dim is the channel count; for FC layers it is the flat dim.
+    Adjacent E matrices remain channel-only for conv layers (full-rank
+    would explode to e.g. 16k×16k). For FC layers it is the flat dim.
     """
     if l < n_conv:
         return int(layer_shapes[l][0])   # C_l
     return int(flat_dims[l])             # D_l
 
 
-def _get_e_source(e_l, l, n_conv):
-    """Return the error signal from layer l suitable for E-matrix operations.
-
-    Conv layers: spatially average to [B, C_l].
-    FC / output layers: return as-is [B, D_l].
-    """
+def _adj_e_source(e_l, l, n_conv):
+    """Adjacent error source — channel-averaged for conv, raw for FC."""
     if l < n_conv:
         return e_l.mean(axis=(2, 3))     # [B, C_l]
     return e_l                           # [B, D_l]
@@ -87,17 +84,18 @@ class CNNRecLRAVariant:
 
         kwargs:
             cnn_channels       : list of output channels per conv layer
-                                  (default [32,64,64,128,128,256,256])
             cnn_fc_width       : hidden FC layer width (default 512)
             n_fc_hidden        : number of hidden FC layers (default 1)
-            kernel_size        : conv kernel size, same for all layers (default 3)
-            input_shape        : (C, H, W) of one input sample (default (3,32,32))
+            kernel_size        : conv kernel size (default 3)
+            input_shape        : (C, H, W) (default (3, 32, 32))
             output_dim         : number of classes (default 10)
-            forward_skip_every : int, default 0 (disabled; conv dims rarely match)
-            error_skip_every   : int, default 2
+            forward_skip_every : default 0
+            error_skip_every   : default 2
+            alpha_e_skip       : α for skip-error endpoints (paper: 0.19)
+            alpha_e_adj        : α for adjacent-error endpoints (paper: 0.24)
+            use_layer_norm     : LayerNorm after each conv & FC hidden (default True)
 
-        Striding rule: stride=2 at odd-indexed conv layers (1, 3, 5, …);
-                       stride=1 at even-indexed conv layers (0, 2, 4, …).
+        Striding rule: stride=2 at odd-indexed conv layers, stride=1 at even.
         """
         cnn_channels       = kwargs.get("cnn_channels",       [32, 64, 64, 128, 128, 256, 256])
         cnn_fc_width       = kwargs.get("cnn_fc_width",       512)
@@ -107,73 +105,107 @@ class CNNRecLRAVariant:
         output_dim         = kwargs.get("output_dim",         _DEFAULT_OUTPUT_DIM)
         forward_skip_every = kwargs.get("forward_skip_every", 0)
         error_skip_every   = kwargs.get("error_skip_every",   2)
+        alpha_e_skip       = kwargs.get("alpha_e_skip",       0.19)
+        alpha_e_adj        = kwargs.get("alpha_e_adj",        0.24)
+        use_layer_norm     = kwargs.get("use_layer_norm",     True)
 
         C_in, H_in, W_in = input_shape
         act_fn_callable   = jpc.get_act_fn(act_fn)
         pad               = (kernel_size - 1) // 2
 
-        layers       = []
-        layer_shapes = []
+        layers        = []
+        layer_shapes  = []
+        layer_norms   = []   # parallel to layers; None where no LN
         cur_C, cur_H, cur_W = C_in, H_in, W_in
 
         # --- conv layers ---
-        # Striding rule: stride=2 at odd indices (1, 3, 5, …), stride=1 at even.
-        # This gives VGG-style progressive downsampling and keeps spatial resolution
-        # valid for networks with many conv layers.
         for i, out_C in enumerate(cnn_channels):
             stride = 2 if (i % 2 == 1) else 1
             key, sub = jr.split(key)
-            layers.append(nn.Conv2d(
+            conv = nn.Conv2d(
                 cur_C, out_C, kernel_size,
                 stride=stride, padding=pad,
                 use_bias=False, key=sub,
-            ))
+            )
+            # Paper p.16: weights init from unit Gaussian.
+            key, sub = jr.split(key)
+            new_w = jr.normal(sub, conv.weight.shape)
+            conv = eqx.tree_at(lambda c: c.weight, conv, new_w)
+            layers.append(conv)
+
             cur_H = (cur_H + 2 * pad - kernel_size) // stride + 1
             cur_W = (cur_W + 2 * pad - kernel_size) // stride + 1
             layer_shapes.append((out_C, cur_H, cur_W))
+
+            if use_layer_norm:
+                ln = nn.LayerNorm(shape=(out_C, cur_H, cur_W),
+                                  use_weight=False, use_bias=False)
+                layer_norms.append(ln)
+            else:
+                layer_norms.append(None)
+
             cur_C = out_C
 
         n_conv   = len(cnn_channels)
         flat_dim = int(cur_C * cur_H * cur_W)
 
-        # --- hidden FC layers (n_fc_hidden of them) ---
+        # --- hidden FC layers ---
         fc_in = flat_dim
         for _ in range(n_fc_hidden):
             key, sub = jr.split(key)
-            layers.append(nn.Linear(fc_in, cnn_fc_width, use_bias=False, key=sub))
+            lin = nn.Linear(fc_in, cnn_fc_width, use_bias=False, key=sub)
+            key, sub = jr.split(key)
+            new_w = jr.normal(sub, lin.weight.shape)
+            lin = eqx.tree_at(lambda l_: l_.weight, lin, new_w)
+            layers.append(lin)
             layer_shapes.append((cnn_fc_width,))
+            if use_layer_norm:
+                layer_norms.append(nn.LayerNorm(shape=(cnn_fc_width,),
+                                                use_weight=False, use_bias=False))
+            else:
+                layer_norms.append(None)
             fc_in = cnn_fc_width
 
         # --- output FC layer ---
+        # Output stays at the equinox default (1/√fan_in) since we train
+        # with MSE on one-hot targets rather than softmax+CE; unit-Gaussian
+        # at the read-out would push outputs to ~√fan_in magnitude.
         key, sub = jr.split(key)
-        layers.append(nn.Linear(fc_in, output_dim, use_bias=False, key=sub))
+        out_lin = nn.Linear(fc_in, output_dim, use_bias=False, key=sub)
+        layers.append(out_lin)
         layer_shapes.append((output_dim,))
+        layer_norms.append(None)   # no LN on output
 
-        total_depth = len(layers)   # n_conv + n_fc_hidden + 1
+        total_depth = len(layers)
         flat_dims   = [int(np.prod(s)) for s in layer_shapes]
 
         # --- E matrices ---
-        # E[l] maps an error source signal to a displacement for layer l.
-        #   Conv layer l  → shape (C_l,       C_source or D_source)
-        #   FC   layer l  → shape (D_l,       D_source)
-        # Indexed l = 1 … total_depth-2  (no E for input-proxy or output layer).
+        # Skip-from-output  (l % m == 0): full FC of shape (D_l, output_dim)
+        #                                  – paper-spec dimensionality.
+        # Adjacent          (otherwise) : channel-only for conv to keep
+        #                                  memory tractable; full FC for FC.
         m = error_skip_every
         E = [None] * total_depth
+        e_is_full = [False] * total_depth   # tracks E layout per layer
         for l in range(1, total_depth - 1):
-            tgt_dim = _source_dim(l, n_conv, layer_shapes, flat_dims)
-            if m > 0 and l % m == 0:
-                # skip connection from output layer
-                src_dim = output_dim
-            else:
-                # adjacent connection from layer l+1
-                src_dim = _source_dim(l + 1, n_conv, layer_shapes, flat_dims)
-            fan_in = src_dim
+            is_skip = (m > 0 and l % m == 0)
             key, sub = jr.split(key)
-            E[l] = jr.normal(sub, (tgt_dim, fan_in)) / jnp.sqrt(float(fan_in))
+            if is_skip:
+                tgt_dim = int(flat_dims[l])
+                src_dim = int(output_dim)
+                E[l] = jr.normal(sub, (tgt_dim, src_dim))
+                e_is_full[l] = True
+            else:
+                tgt_dim = _adj_source_dim(l, n_conv, layer_shapes, flat_dims)
+                src_dim = _adj_source_dim(l + 1, n_conv, layer_shapes, flat_dims)
+                E[l] = jr.normal(sub, (tgt_dim, src_dim))
+                e_is_full[l] = (l >= n_conv)   # full only for FC adjacent
 
         return {
             "model":              layers,
+            "layer_norms":        layer_norms,
             "E":                  E,
+            "e_is_full":          e_is_full,
             "act_fn":             act_fn_callable,
             "depth":              total_depth,
             "n_conv":             n_conv,
@@ -183,6 +215,9 @@ class CNNRecLRAVariant:
             "input_shape":        input_shape,
             "forward_skip_every": forward_skip_every,
             "error_skip_every":   error_skip_every,
+            "alpha_e_skip":       alpha_e_skip,
+            "alpha_e_adj":        alpha_e_adj,
+            "use_layer_norm":     use_layer_norm,
         }
 
     # ------------------------------------------------------------------
@@ -192,10 +227,13 @@ class CNNRecLRAVariant:
     def forward_pass(self, bundle, x_batch):
         """Single forward pass.
 
-        x_batch: [B, C*H*W] (flat CIFAR-10 as delivered by the dataloader)
-        Returns z (post-act), h (pre-act) — each a list of L tensors.
+        h[l] is the *post-LayerNorm pre-activation* signal — i.e. the value
+        used for target generation in the backward sweep. The Hebbian W
+        update still uses the raw pre-LN preactivation, since that is what
+        the conv weight produces.
         """
         layers       = bundle["model"]
+        layer_norms  = bundle.get("layer_norms", [None] * bundle["depth"])
         act_fn       = bundle["act_fn"]
         n_conv       = bundle["n_conv"]
         n            = bundle["forward_skip_every"]
@@ -203,30 +241,33 @@ class CNNRecLRAVariant:
         input_shape  = bundle["input_shape"]
 
         B = x_batch.shape[0]
-        # reshape flat input to spatial
         z_prev = x_batch.reshape(B, *input_shape)
 
         z = [None] * L
         h = [None] * L
 
         for l in range(L):
-            # Transition from spatial to flat at the first FC layer
             if l == n_conv:
                 z_prev = z_prev.reshape(B, -1)
 
-            h[l] = vmap(layers[l])(z_prev)
+            pre = vmap(layers[l])(z_prev)
 
-            # Forward skip connection (dimension-guarded)
+            # Forward skip (dimension-guarded)
             if n > 0 and l >= n and l % n == 0:
                 src = z[l - n]
-                if src is not None and src.shape == h[l].shape:
-                    h[l] = h[l] + src
+                if src is not None and src.shape == pre.shape:
+                    pre = pre + src
 
-            # Post-activation (no activation on output layer)
+            # LayerNorm on hidden layers; output layer left alone.
+            if layer_norms[l] is not None and l < L - 1:
+                pre = vmap(layer_norms[l])(pre)
+
+            h[l] = pre
+
             if l < L - 1:
-                z[l] = vmap(act_fn)(h[l])
+                z[l] = vmap(act_fn)(pre)
             else:
-                z[l] = h[l]
+                z[l] = pre
 
             z_prev = z[l]
 
@@ -237,50 +278,66 @@ class CNNRecLRAVariant:
     # ------------------------------------------------------------------
 
     def compute_targets_and_errors(self, bundle, z, h, y_batch, beta):
-        """Backward sweep: compute per-layer targets and errors."""
+        """Backward sweep: compute per-layer targets and errors.
+
+        Skip-from-output E entries are full-rank (D_l, output_dim); the
+        displacement is reshaped to the spatial layout of the layer.
+        Adjacent E entries are channel-only for conv (broadcast spatially)
+        and full for FC, matching create_model.
+        """
         E_matrices   = bundle["E"]
+        e_is_full    = bundle["e_is_full"]
         m            = bundle["error_skip_every"]
         act_fn       = bundle["act_fn"]
         L            = bundle["depth"]
         n_conv       = bundle["n_conv"]
         layer_shapes = bundle["layer_shapes"]
+        alpha_skip   = bundle.get("alpha_e_skip", 0.19)
+        alpha_adj    = bundle.get("alpha_e_adj", 0.24)
         B            = z[0].shape[0]
 
         e = [None] * L
         d = [None] * L
 
-        # Output error (always flat [B, D_out])
-        e[L - 1] = z[L - 1] - y_batch
+        # Output is treated as a skip endpoint
+        e[L - 1] = alpha_mix_error(z[L - 1], y_batch, alpha_skip)
 
         for l in range(L - 2, -1, -1):
+            is_skip = (m > 0 and l % m == 0)
+
             if l == 0:
                 d[l] = jnp.zeros_like(z[l])
             elif E_matrices[l] is not None:
-                if m > 0 and l % m == 0:
-                    # Skip from output layer
-                    e_src = e[L - 1]                           # [B, D_out]
+                if is_skip:
+                    e_src = e[L - 1]                       # [B, output_dim]
                 else:
-                    # Adjacent: source is layer l+1
-                    e_src = _get_e_source(e[l + 1], l + 1, n_conv)  # [B, C or D]
+                    e_src = _adj_e_source(e[l + 1], l + 1, n_conv)
 
-                d_vec = e_src @ E_matrices[l].T                # [B, tgt_dim]
+                d_vec = e_src @ E_matrices[l].T            # [B, tgt_dim]
 
-                if l < n_conv:
-                    # Broadcast channel-wise correction to full spatial shape
+                if e_is_full[l] and l < n_conv:
+                    # Full-rank skip-from-output to a conv layer: reshape
+                    # the (D_l,) displacement back to (C_l, H_l, W_l).
                     C_l, H_l, W_l = layer_shapes[l]
-                    d[l] = d_vec.reshape(B, C_l, 1, 1) * jnp.ones((B, C_l, H_l, W_l))
+                    d[l] = d_vec.reshape(B, C_l, H_l, W_l)
+                elif l < n_conv:
+                    # Channel-only adjacent: broadcast spatially.
+                    C_l, H_l, W_l = layer_shapes[l]
+                    d[l] = jnp.broadcast_to(
+                        d_vec.reshape(B, C_l, 1, 1), (B, C_l, H_l, W_l)
+                    )
                 else:
-                    d[l] = d_vec                               # [B, D_l]
+                    d[l] = d_vec                            # FC layer
             else:
                 d[l] = jnp.zeros_like(z[l])
 
-            # Target and error
             if l < L - 1:
                 y_l = vmap(act_fn)(h[l] - beta * d[l])
             else:
                 y_l = h[l] - beta * d[l]
 
-            e[l] = z[l] - y_l
+            alpha_l = alpha_skip if is_skip else alpha_adj
+            e[l] = alpha_mix_error(z[l], y_l, alpha_l)
 
         return e, d
 
@@ -334,24 +391,27 @@ class CNNRecLRAVariant:
 
             delta_W.append(dW)
 
-        # --- E updates (Hebbian Eq. 6): ΔE = -γ * d_avg ⊗ e_src_avg ---
+        # --- E updates (Hebbian Eq. 6): ΔE = -γ * d ⊗ e_src ---
+        # The dimensionality of d depends on the E layout: full-rank skip
+        # uses flattened d[l]; channel-only adjacent uses spatial average.
+        e_is_full = bundle["e_is_full"]
         for l in range(2, L - 1):
             if E_matrices[l] is None:
                 continue
+            is_skip = (m > 0 and l % m == 0)
 
-            # Spatially-averaged displacement at layer l
-            if l < n_conv:
-                d_avg = d[l].mean(axis=(2, 3))    # [B, C_l]
+            if e_is_full[l]:
+                # Full layout: d[l] is (B, ...spatial); flatten target side
+                d_flat = d[l].reshape(B, -1)          # [B, D_l]
             else:
-                d_avg = d[l]                       # [B, D_l]
+                d_flat = d[l].mean(axis=(2, 3)) if l < n_conv else d[l]
 
-            # Error source
-            if m > 0 and l % m == 0:
-                e_src = e[L - 1]                   # [B, D_out]
+            if is_skip:
+                e_src = e[L - 1]                       # [B, output_dim]
             else:
-                e_src = _get_e_source(e[l + 1], l + 1, n_conv)
+                e_src = _adj_e_source(e[l + 1], l + 1, n_conv)
 
-            delta_E[l] = -gamma * jnp.einsum('bi,bj->ij', d_avg, e_src) / B
+            delta_E[l] = -gamma * jnp.einsum('bi,bj->ij', d_flat, e_src) / B
 
         return delta_W, delta_E
 
@@ -366,11 +426,14 @@ class CNNRecLRAVariant:
         Only E matrices are differentiated; W stays Hebbian.
         """
         E_matrices   = bundle["E"]
+        e_is_full    = bundle["e_is_full"]
         m            = bundle["error_skip_every"]
         act_fn       = bundle["act_fn"]
         L            = bundle["depth"]
         n_conv       = bundle["n_conv"]
         layer_shapes = bundle["layer_shapes"]
+        alpha_skip   = bundle.get("alpha_e_skip", 0.19)
+        alpha_adj    = bundle.get("alpha_e_adj", 0.24)
         B            = z[0].shape[0]
 
         active_indices = [l for l in range(L) if E_matrices[l] is not None]
@@ -385,22 +448,29 @@ class CNNRecLRAVariant:
                 E_full[l] = E_active_list[idx]
 
             e  = [None] * L
-            e[L - 1] = z[L - 1] - y_batch
+            e[L - 1] = alpha_mix_error(z[L - 1], y_batch, alpha_skip)
 
             for l in range(L - 2, -1, -1):
+                is_skip = (m > 0 and l % m == 0)
                 if l == 0:
                     d_l = jnp.zeros_like(z[l])
                 elif E_full[l] is not None:
-                    if m > 0 and l % m == 0:
+                    if is_skip:
                         e_src = e[L - 1]
                     else:
-                        e_src = _get_e_source(e[l + 1], l + 1, n_conv)
+                        e_src = _adj_e_source(e[l + 1], l + 1, n_conv)
 
                     d_vec = e_src @ E_full[l].T
 
-                    if l < n_conv:
+                    if e_is_full[l] and l < n_conv:
                         C_l, H_l, W_l = layer_shapes[l]
-                        d_l = d_vec.reshape(B, C_l, 1, 1) * jnp.ones((B, C_l, H_l, W_l))
+                        d_l = d_vec.reshape(B, C_l, H_l, W_l)
+                    elif l < n_conv:
+                        C_l, H_l, W_l = layer_shapes[l]
+                        d_l = jnp.broadcast_to(
+                            d_vec.reshape(B, C_l, 1, 1),
+                            (B, C_l, H_l, W_l),
+                        )
                     else:
                         d_l = d_vec
                 else:
@@ -411,9 +481,9 @@ class CNNRecLRAVariant:
                 else:
                     y_l = h[l] - beta * d_l
 
-                e[l] = z[l] - y_l
+                alpha_l = alpha_skip if is_skip else alpha_adj
+                e[l] = alpha_mix_error(z[l], y_l, alpha_l)
 
-            # Sum squared errors over all layers
             D = sum(
                 jnp.mean(jnp.sum(e[l].reshape(B, -1) ** 2, axis=1))
                 for l in range(L) if e[l] is not None
