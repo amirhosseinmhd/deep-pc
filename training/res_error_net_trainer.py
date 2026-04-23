@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import jpc
 import optax
+import equinox as eqx
 
 from common.data import set_seed, get_dataloaders
 from common.metrics import MetricsCollector
@@ -26,9 +27,20 @@ from variants.res_error_net import (
 )
 
 
+# Fused path: for variants that expose `compute_updates_fused`, compute
+# e, ΔW, ΔV and per-layer energies in a single JIT — saves two forward
+# passes per batch by reusing one autodiff trace through the network.
+@eqx.filter_jit
+def _jit_compute_updates_fused(variant, bundle, z, x_batch, y_batch,
+                               alpha, rule, v_reg):
+    return variant.compute_updates_fused(
+        bundle, z, x_batch, y_batch, alpha, rule=rule, v_reg=v_reg,
+    )
+
+
 def train_res_error_net(
     variant,
-    model,
+    bundle,
     depth,
     seed,
     param_lr,
@@ -66,8 +78,8 @@ def train_res_error_net(
         else:
             w_optim = optax.adam(param_lr, eps=1e-12)
             v_optim = optax.adam(v_lr, eps=1e-12)
-        w_opt_state = variant.init_w_optim_states(model, w_optim)
-        v_opt_state = variant.init_v_optim_states(model, v_optim)
+        w_opt_state = variant.init_w_optim_states(bundle, w_optim)
+        v_opt_state = variant.init_v_optim_states(bundle, v_optim)
 
     noise_key = jr.PRNGKey(seed + 1)
 
@@ -85,6 +97,8 @@ def train_res_error_net(
     if use_wandb:
         from common.wandb_logger import log_step_metrics
         wandb_layer_idxs = list(range(depth))
+
+    use_fused = hasattr(variant, "compute_updates_fused")
 
     data_iter = iter(train_loader)
     for iter_num in range(n_train_iters):
@@ -104,42 +118,50 @@ def train_res_error_net(
             )
 
         if track_weight_updates:
-            old_weights = variant.get_weight_arrays(model)
+            old_weights = variant.get_weight_arrays(bundle)
             old_weights = [jnp.array(w) for w in old_weights]
 
         # --- Step 1: Feed-forward init ---
-        z_init, _ = _jit_forward_pass(variant, model, img_batch)
+        z_init, _ = _jit_forward_pass(variant, bundle, img_batch)
 
         if track_activity_norms:
             metrics.record_activity_norms_pre(z_init)
 
         # --- Step 2-3: Clamp output + T inference steps (JIT scan) ---
         z, _ = variant.run_inference(
-            model, img_batch, label_batch,
+            bundle, img_batch, label_batch,
             alpha=alpha, dt=inference_dt, T=inference_T,
             z_init=z_init, record_energy=False,
         )
 
-        # --- Errors at convergence (for logging & updates) ---
-        e = _jit_compute_errors(variant, model, z, img_batch, label_batch)
-
-        if track_layer_energy:
-            # One host-sync instead of one per layer.
-            energies_jax = jnp.stack(
-                [0.5 * jnp.mean(jnp.sum(el ** 2, axis=1)) for el in e]
+        if use_fused:
+            # Single JIT: e + ΔW + ΔV + per-layer energies from one forward+backward.
+            e, delta_W, delta_V, energies_jax = _jit_compute_updates_fused(
+                variant, bundle, z, img_batch, label_batch,
+                alpha, v_update_rule, v_reg,
             )
-            metrics.energy_per_layer.append(energies_jax.tolist())
+            if track_layer_energy:
+                metrics.energy_per_layer.append(energies_jax.tolist())
+        else:
+            # --- Errors at convergence (for logging & updates) ---
+            e = _jit_compute_errors(variant, bundle, z, img_batch, label_batch)
 
-        # --- Step 4: ΔW from F_pc autodiff ---
-        delta_W = _jit_compute_W_updates(
-            variant, model, z, img_batch, label_batch, alpha
-        )
+            if track_layer_energy:
+                energies_jax = jnp.stack(
+                    [0.5 * jnp.mean(jnp.sum(el ** 2, axis=1)) for el in e]
+                )
+                metrics.energy_per_layer.append(energies_jax.tolist())
 
-        # --- Step 5: ΔV per configured rule (+ optional L2 on V) ---
-        delta_V = _jit_compute_V_updates(
-            variant, model, z, img_batch, label_batch, alpha,
-            v_update_rule, v_reg,
-        )
+            # --- Step 4: ΔW from F_pc autodiff ---
+            delta_W = _jit_compute_W_updates(
+                variant, bundle, z, img_batch, label_batch, alpha
+            )
+
+            # --- Step 5: ΔV per configured rule (+ optional L2 on V) ---
+            delta_V = _jit_compute_V_updates(
+                variant, bundle, z, img_batch, label_batch, alpha,
+                v_update_rule, v_reg,
+            )
 
         # --- Step 6: Re-project ---
         if reproject_c is not None and reproject_c > 0.0:
@@ -154,24 +176,24 @@ def train_res_error_net(
 
         # --- Step 7: Apply ---
         if use_optax:
-            model, w_opt_state, v_opt_state = variant.apply_optax_updates(
-                model, delta_W, delta_V,
+            bundle, w_opt_state, v_opt_state = variant.apply_optax_updates(
+                bundle, delta_W, delta_V,
                 w_optim, w_opt_state, v_optim, v_opt_state,
             )
         else:
-            model = variant.apply_sgd_updates(
-                model, delta_W, delta_V, param_lr, v_lr
+            bundle = variant.apply_sgd_updates(
+                bundle, delta_W, delta_V, param_lr, v_lr
             )
 
         if track_activity_norms:
             metrics.record_activity_norms_post(z)
 
         if track_weight_updates:
-            new_weights = variant.get_weight_arrays(model)
+            new_weights = variant.get_weight_arrays(bundle)
             metrics.record_weight_update_norms(old_weights, new_weights)
 
         # --- Loss / accuracy on feed-forward output (no inference, no clamp) ---
-        z_ff, _ = _jit_forward_pass(variant, model, img_batch)
+        z_ff, _ = _jit_forward_pass(variant, bundle, img_batch)
         preds = z_ff[-1]
         if loss_type == "ce":
             train_loss = float(jpc.cross_entropy_loss(preds, label_batch))
@@ -203,8 +225,8 @@ def train_res_error_net(
                         wb_metrics[f"energy/layer_{idx+1}"] = last_e[idx]
 
             # V-highway norms
-            V_arrays = variant.get_V_arrays(model)
-            S = model["highway_indices"]
+            V_arrays = variant.get_V_arrays(bundle)
+            S = bundle["highway_indices"]
             for idx_v, i in enumerate(S):
                 wb_metrics[f"v_norm/layer_{i}"] = float(
                     jnp.linalg.norm(jnp.ravel(V_arrays[idx_v]))
@@ -217,7 +239,7 @@ def train_res_error_net(
             break
 
         if ((iter_num + 1) % test_every) == 0:
-            avg_acc = variant.evaluate(model, test_loader)
+            avg_acc = variant.evaluate(bundle, test_loader)
             metrics.record_test(iter_num + 1, avg_acc)
             print(
                 f"  Iter {iter_num+1}, loss={train_loss:.4f}, "
