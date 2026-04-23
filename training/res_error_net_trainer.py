@@ -20,6 +20,10 @@ import optax
 from common.data import set_seed, get_dataloaders
 from common.metrics import MetricsCollector
 from variants.rec_lra_common import reproject_to_ball, add_input_noise
+from variants.res_error_net import (
+    _jit_forward_pass, _jit_compute_errors,
+    _jit_compute_W_updates, _jit_compute_V_updates,
+)
 
 
 def train_res_error_net(
@@ -43,6 +47,7 @@ def train_res_error_net(
     reproject_c=1.0,
     input_noise_sigma=0.1,
     weight_decay=1e-4,
+    v_reg=0.0,
     use_zca=False,
     track_weight_updates=True,
     track_activity_norms=True,
@@ -103,12 +108,12 @@ def train_res_error_net(
             old_weights = [jnp.array(w) for w in old_weights]
 
         # --- Step 1: Feed-forward init ---
-        z_init, _ = variant.forward_pass(model, img_batch)
+        z_init, _ = _jit_forward_pass(variant, model, img_batch)
 
         if track_activity_norms:
             metrics.record_activity_norms_pre(z_init)
 
-        # --- Step 2-3: Clamp output + T inference steps ---
+        # --- Step 2-3: Clamp output + T inference steps (JIT scan) ---
         z, _ = variant.run_inference(
             model, img_batch, label_batch,
             alpha=alpha, dt=inference_dt, T=inference_T,
@@ -116,21 +121,24 @@ def train_res_error_net(
         )
 
         # --- Errors at convergence (for logging & updates) ---
-        e = variant.compute_errors(model, z, img_batch, label_batch)
+        e = _jit_compute_errors(variant, model, z, img_batch, label_batch)
 
         if track_layer_energy:
-            layer_energies = [
-                float(0.5 * jnp.mean(jnp.sum(el ** 2, axis=1)))
-                for el in e
-            ]
-            metrics.energy_per_layer.append(layer_energies)
+            # One host-sync instead of one per layer.
+            energies_jax = jnp.stack(
+                [0.5 * jnp.mean(jnp.sum(el ** 2, axis=1)) for el in e]
+            )
+            metrics.energy_per_layer.append(energies_jax.tolist())
 
         # --- Step 4: ΔW from F_pc autodiff ---
-        delta_W = variant.compute_W_updates(model, z, img_batch, label_batch)
+        delta_W = _jit_compute_W_updates(
+            variant, model, z, img_batch, label_batch, alpha
+        )
 
-        # --- Step 5: ΔV per configured rule ---
-        delta_V = variant.compute_V_updates(
-            model, z, img_batch, label_batch, alpha, rule=v_update_rule,
+        # --- Step 5: ΔV per configured rule (+ optional L2 on V) ---
+        delta_V = _jit_compute_V_updates(
+            variant, model, z, img_batch, label_batch, alpha,
+            v_update_rule, v_reg,
         )
 
         # --- Step 6: Re-project ---
@@ -139,8 +147,10 @@ def train_res_error_net(
             delta_V = [reproject_to_ball(dv, reproject_c) for dv in delta_V]
 
         if track_grad_norms:
-            grad_norms = [float(jnp.linalg.norm(jnp.ravel(dw))) for dw in delta_W]
-            metrics.grad_norms.append(grad_norms)
+            grad_norms_jax = jnp.stack(
+                [jnp.linalg.norm(jnp.ravel(dw)) for dw in delta_W]
+            )
+            metrics.grad_norms.append(grad_norms_jax.tolist())
 
         # --- Step 7: Apply ---
         if use_optax:
@@ -161,7 +171,7 @@ def train_res_error_net(
             metrics.record_weight_update_norms(old_weights, new_weights)
 
         # --- Loss / accuracy on feed-forward output (no inference, no clamp) ---
-        z_ff, _ = variant.forward_pass(model, img_batch)
+        z_ff, _ = _jit_forward_pass(variant, model, img_batch)
         preds = z_ff[-1]
         if loss_type == "ce":
             train_loss = float(jpc.cross_entropy_loss(preds, label_batch))

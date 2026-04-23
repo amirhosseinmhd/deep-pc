@@ -136,17 +136,20 @@ class ExperimentConfig:
     kernel_size: int = 3
 
     # res-error-net specific
-    res_highway_every_k: int = 5
-    res_alpha: float = 0.1
-    res_inference_T: int = 100
+    res_highway_every_k: int = 3
+    res_alpha: float = 1
+    res_inference_T: int = 50
     res_inference_dt: float = 0.1
     res_v_lr: float = 1e-4
-    res_v_update_rule: str = "state"   # "energy" or "state"
-    res_v_init_scale: float = 0.01
+    res_v_update_rule: str = "energy"   # "energy" or "state"
+    res_v_init_scale: float = 1
     res_output_clamp: str = "hard"       # soft reserved for future
     res_optim: str = "adamw"
     res_loss: str = "mse"
     res_init_scheme: str = "jpc_default"  # "jpc_default" or "unit_gaussian"
+    # L2 penalty ρ on V_{L→i}. Adds (ρ/2)·Σ‖V‖² to F_aug so ΔV gains a +ρ·V
+    # term, keeping V bounded and F bounded below in V.
+    res_v_reg: float = 0.0
 
     # Condition number experiment
     cond_width: int = COND_WIDTH

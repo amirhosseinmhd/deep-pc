@@ -80,6 +80,7 @@ def one_hot(labels, n_classes=10):
 # ---------------------------------------------------------------------------
 DATASET_INPUT_DIMS = {
     "MNIST": 28 * 28,          # 784
+    "FashionMNIST": 28 * 28,   # 784
     "CIFAR10": 32 * 32 * 3,    # 3072
 }
 
@@ -103,6 +104,27 @@ class MNIST(datasets.MNIST):
             transform = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize(mean=(0.1307,), std=(0.3081,))
+            ])
+        else:
+            transform = transforms.Compose([transforms.ToTensor()])
+        super().__init__(save_dir, download=True, train=train, transform=transform)
+
+    def __getitem__(self, index):
+        img, label = super().__getitem__(index)
+        img = torch.flatten(img)
+        label = one_hot(label)
+        return img, label
+
+
+# ---------------------------------------------------------------------------
+# Fashion-MNIST
+# ---------------------------------------------------------------------------
+class FashionMNIST(datasets.FashionMNIST):
+    def __init__(self, train, normalise=True, save_dir="data"):
+        if normalise:
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=(0.2860,), std=(0.3530,))
             ])
         else:
             transform = transforms.Compose([transforms.ToTensor()])
@@ -161,6 +183,20 @@ def get_mnist_loaders(batch_size):
     return train_loader, test_loader
 
 
+def get_fashion_mnist_loaders(batch_size):
+    train_data = FashionMNIST(train=True, normalise=True)
+    test_data = FashionMNIST(train=False, normalise=True)
+    train_loader = DataLoader(
+        dataset=train_data, batch_size=batch_size,
+        shuffle=True, drop_last=True
+    )
+    test_loader = DataLoader(
+        dataset=test_data, batch_size=batch_size,
+        shuffle=True, drop_last=True
+    )
+    return train_loader, test_loader
+
+
 def get_cifar10_loaders(batch_size, use_zca=True):
     train_data = CIFAR10(train=True, normalise=True, use_zca=use_zca)
     test_data = CIFAR10(train=False, normalise=True, use_zca=use_zca)
@@ -179,9 +215,11 @@ def get_dataloaders(dataset, batch_size, use_zca=True):
     """Return (train_loader, test_loader) for the given dataset name."""
     if dataset == "MNIST":
         return get_mnist_loaders(batch_size)
+    elif dataset == "FashionMNIST":
+        return get_fashion_mnist_loaders(batch_size)
     elif dataset == "CIFAR10":
         return get_cifar10_loaders(batch_size, use_zca=use_zca)
     else:
         raise ValueError(
-            f"Unknown dataset '{dataset}'. Options: MNIST, CIFAR10"
+            f"Unknown dataset '{dataset}'. Options: MNIST, FashionMNIST, CIFAR10"
         )

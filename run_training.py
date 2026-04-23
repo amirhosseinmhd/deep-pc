@@ -101,6 +101,7 @@ def run_single(cfg):
                     reproject_c=cfg.reproject_c,
                     input_noise_sigma=cfg.input_noise_sigma,
                     weight_decay=cfg.weight_decay,
+                    v_reg=cfg.res_v_reg,
                     use_zca=cfg.use_zca,
                     track_weight_updates=cfg.track_weight_updates,
                     track_activity_norms=cfg.track_activity_norms,
@@ -197,7 +198,7 @@ def main():
         description="Run unified PC training experiments"
     )
     parser.add_argument(
-        "--dataset", choices=["MNIST", "CIFAR10"], default=None,
+        "--dataset", choices=["MNIST", "FashionMNIST", "CIFAR10"], default=None,
         help="Dataset to train on (default: MNIST)",
     )
     parser.add_argument(
@@ -352,9 +353,14 @@ def main():
         help="Loss for res-error-net reporting (default: mse)",
     )
     parser.add_argument(
-        "--res-init-scheme", choices=["jpc_default", "unit_gaussian"], default=None,
+        "--res-init-scheme", choices=["jpc_default", "unit_gaussian", "kaiming"], default=None,
         help="Weight init for res-error-net. 'jpc_default' = 1/√fan_in (stable), "
              "'unit_gaussian' = rec-LRA paper style (needs ZCA / small dt)",
+    )
+    parser.add_argument(
+        "--res-v-reg", type=float, default=None,
+        help="L2 penalty ρ on V highway matrices (res-error-net, default: 0.0). "
+             "Adds ρ·V to ΔV so F_aug is bounded below in V.",
     )
     # CNN-rec-LRA arguments
     parser.add_argument(
@@ -480,6 +486,8 @@ def main():
             overrides["res_loss"] = args.res_loss
         if args.res_init_scheme is not None:
             overrides["res_init_scheme"] = args.res_init_scheme
+        if args.res_v_reg is not None:
+            overrides["res_v_reg"] = args.res_v_reg
         if args.cnn_channels:
             overrides["cnn_channels"] = args.cnn_channels
         if args.cnn_fc_width:

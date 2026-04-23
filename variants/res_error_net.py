@@ -31,6 +31,45 @@ from config import INPUT_DIM as _DEFAULT_INPUT_DIM, OUTPUT_DIM as _DEFAULT_OUTPU
 from common.utils import get_weight_list
 
 
+# Module-level JIT helpers. eqx.filter_jit auto-partitions args: jax arrays →
+# traced (dynamic), everything else (Python ints/floats/strings/callables and
+# lists/dicts of those) → static. ResErrorNetVariant is an empty, hashable
+# class so `variant` is treated as static and the compile is cached per call
+# site. Without these wrappers the inference loop runs ~40× eager dispatches
+# per batch, dominating training time.
+
+@eqx.filter_jit
+def _jit_inference_scan(variant, bundle, z_init, x_batch, y_batch, alpha, dt, T):
+    def body(z, _):
+        new_z = variant.inference_step(bundle, z, x_batch, y_batch, alpha, dt)
+        return new_z, None
+    z_out, _ = jax.lax.scan(body, z_init, None, length=T)
+    return z_out
+
+
+@eqx.filter_jit
+def _jit_forward_pass(variant, bundle, x_batch):
+    return variant.forward_pass(bundle, x_batch)
+
+
+@eqx.filter_jit
+def _jit_compute_errors(variant, bundle, z, x_batch, y_batch):
+    return variant.compute_errors(bundle, z, x_batch, y_batch)
+
+
+@eqx.filter_jit
+def _jit_compute_W_updates(variant, bundle, z, x_batch, y_batch, alpha):
+    bundle = {**bundle, "alpha_for_w_grad": alpha}
+    return variant.compute_W_updates(bundle, z, x_batch, y_batch)
+
+
+@eqx.filter_jit
+def _jit_compute_V_updates(variant, bundle, z, x_batch, y_batch, alpha, rule, v_reg):
+    return variant.compute_V_updates(
+        bundle, z, x_batch, y_batch, alpha, rule=rule, v_reg=v_reg
+    )
+
+
 class ResErrorNetVariant:
     """True iterative PC with residual error highways V_{L→i}."""
 
@@ -61,6 +100,9 @@ class ResErrorNetVariant:
 
         if init_scheme == "unit_gaussian":
             model = self._reinit_unit_gaussian(model, key)
+            key, _ = jr.split(key)
+        elif init_scheme == "kaiming":
+            model = self._reinit_kaiming(model, key, act_fn)
             key, _ = jr.split(key)
 
         dims = [output_dim if (i + 1) == depth else width for i in range(depth)]
@@ -93,6 +135,33 @@ class ResErrorNetVariant:
             "depth": depth,
             "dims": dims,
         }
+
+    @staticmethod
+    def _reinit_kaiming(model, key, act_fn_name):
+        """Proper variance-preserving init.
+
+        relu/gelu → Kaiming: N(0, 2/n_in).
+        tanh      → Xavier w/ gain 5/3: N(0, (5/3)²/n_in).
+        Everything else defaults to Xavier: N(0, 1/n_in).
+        """
+        if act_fn_name in ("relu", "gelu"):
+            gain_sq = 2.0
+        elif act_fn_name == "tanh":
+            gain_sq = 1.0
+        else:
+            gain_sq = 1.0
+
+        new_layers = list(model)
+        for l in range(len(new_layers)):
+            seq = new_layers[l]
+            linear = seq.layers[1]
+            fan_in = linear.weight.shape[1]
+            std = (gain_sq / fan_in) ** 0.5
+            key, sub = jr.split(key)
+            new_w = std * jr.normal(sub, linear.weight.shape)
+            new_linear = eqx.tree_at(lambda lin: lin.weight, linear, new_w)
+            new_layers[l] = eqx.tree_at(lambda s: s.layers[1], seq, new_linear)
+        return new_layers
 
     @staticmethod
     def _reinit_unit_gaussian(model, key):
@@ -192,32 +261,52 @@ class ResErrorNetVariant:
         z = list(z_init)
         z[L - 1] = y_batch
 
-        energies = [] if record_energy else None
+        if not record_energy:
+            z = _jit_inference_scan(
+                self, bundle, z, x_batch, y_batch, alpha, dt, T
+            )
+            return z, None
+
+        # Diagnostic path (used by diagnose_*.py scripts) — keep eager so we
+        # can sync per-step free-energy without breaking trace.
+        energies = []
         for _ in range(T):
             z = self.inference_step(bundle, z, x_batch, y_batch, alpha, dt)
-            if record_energy:
-                z_free = [z[l] for l in range(L - 1)]
-                energies.append(float(
-                    self.free_energy_z(z_free, bundle, x_batch, y_batch, alpha)
-                ))
+            z_free = [z[l] for l in range(L - 1)]
+            energies.append(float(
+                self.free_energy_z(z_free, bundle, x_batch, y_batch, alpha)
+            ))
         return z, energies
 
     # --- Parameter updates ---
 
     def compute_W_updates(self, bundle, z, x_batch, y_batch):
-        """∂F_pc/∂W^l via autodiff. Treat as gradient: W ← W - lr·ΔW."""
+        """∂F_aug/∂W^l via autodiff, where F_aug = F_pc + F_highway.
+
+        Differentiating F_highway wrt W^l gives a ResNet-style shortcut
+        α·(V_l e^L)⊙act'(h^l) ⊗ z^{l-1} for every l in the highway set S —
+        this is the direct output-error signal into each highway-connected
+        layer. Earlier versions dropped this term ('W update unchanged')
+        which reproduced standard PC's vanishing signal at depth.
+        """
         model = bundle["model"]
         act_fn = bundle["act_fn"]
         L = bundle["depth"]
+        S = bundle["highway_indices"]
+        V_list = bundle["V_list"]
+        alpha = bundle.get("alpha_for_w_grad", None)
 
         z_list = list(z)
         z_list[L - 1] = y_batch
 
-        def pc_energy(model_):
+        def aug_energy(model_):
             e, _, _ = self._predictions_and_errors(model_, z_list, x_batch, act_fn, L)
-            return self._F_pc(e)
+            f = self._F_pc(e)
+            if alpha is not None and S:
+                f = f + self._F_highway(e, V_list, S, alpha, L)
+            return f
 
-        grads_model = eqx.filter_grad(pc_energy)(model)
+        grads_model = eqx.filter_grad(aug_energy)(model)
 
         delta_W = []
         for l in range(L):
@@ -226,27 +315,35 @@ class ResErrorNetVariant:
             delta_W.append(linear_grad.weight)
         return delta_W
 
-    def compute_V_updates(self, bundle, z, x_batch, y_batch, alpha, rule="energy"):
+    def compute_V_updates(self, bundle, z, x_batch, y_batch, alpha,
+                          rule="energy", v_reg=0.0):
         """ΔV_{L→i}. Sign convention: treat as 'gradient', i.e. V ← V - lr·ΔV.
 
-        energy: ΔV = +α e^i (e^L)ᵀ   (derived from ∂F_hw/∂V)
-        state : ΔV = -α z^i (e^L)ᵀ   (so subtracting yields Hebbian growth)
+        energy: ΔV = +α e^i (e^L)ᵀ + ρ·V     (∂F_hw/∂V + ∂F_reg/∂V)
+        state : ΔV = -α z^i (e^L)ᵀ + ρ·V     (so subtracting yields Hebbian growth)
+
+        v_reg (ρ) adds an L2 penalty (ρ/2)·‖V‖² to the augmented free energy,
+        bounding F below in V and preventing unbounded growth of the highway
+        term.
         """
         S = bundle["highway_indices"]
         L = bundle["depth"]
+        V_list = bundle["V_list"]
         batch_size = x_batch.shape[0]
 
         e = self.compute_errors(bundle, z, x_batch, y_batch)
         e_L = e[L - 1]
 
         delta_V = []
-        for i in S:
+        for idx, i in enumerate(S):
             if rule == "energy":
                 dV = alpha * jnp.einsum("bi,bj->ij", e[i], e_L) / batch_size
             elif rule == "state":
                 dV = -alpha * jnp.einsum("bi,bj->ij", z[i], e_L) / batch_size
             else:
                 raise ValueError(f"Unknown v_update_rule: {rule!r}")
+            if v_reg and v_reg > 0.0:
+                dV = dV + v_reg * V_list[idx]
             delta_V.append(dV)
         return delta_V
 
