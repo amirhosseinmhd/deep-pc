@@ -55,12 +55,14 @@ VARIANT_MUPC = "mupc"
 VARIANT_REC_LRA = "rec_lra"
 VARIANT_CNN_REC_LRA = "cnn_rec_lra"
 VARIANT_RES_ERROR_NET = "res_error_net"
+VARIANT_RES_ERROR_NET_RESNET18 = "res_error_net_resnet18"
 
 ALL_VARIANTS = [
     VARIANT_BASELINE, VARIANT_RESNET, VARIANT_BF,
     VARIANT_BF_V2, VARIANT_DYT, VARIANT_DYT_V2,
     VARIANT_DYT_V3, VARIANT_MUPC, VARIANT_REC_LRA,
     VARIANT_CNN_REC_LRA, VARIANT_RES_ERROR_NET,
+    VARIANT_RES_ERROR_NET_RESNET18,
 ]
 
 
@@ -150,6 +152,25 @@ class ExperimentConfig:
     # L2 penalty ρ on V_{L→i}. Adds (ρ/2)·Σ‖V‖² to F_aug so ΔV gains a +ρ·V
     # term, keeping V bounded and F bounded below in V.
     res_v_reg: float = 0.0
+
+    # res-error-net-resnet18 specific (CIFAR-10 ResNet-18 backbone)
+    # `res_resnet_channels` = [stem_C, stage1_C, stage2_C, stage3_C, stage4_C];
+    # blocks_per_stage=2 → 8 basic blocks (ResNet-18 layout).
+    res_resnet_channels: List[int] = field(default_factory=lambda: [64, 64, 128, 256, 512])
+    res_resnet_blocks_per_stage: int = 2
+    # "dyt" → DyT(x)=γ·tanh(α·x)+β per channel (stateless, per-example);
+    # "none" → identity. No BatchNorm: running stats go stale during T-step
+    # iterative inference.
+    res_resnet_normalization: str = "dyt"
+    res_resnet_dyt_init_alpha: float = 0.5
+    # Whether z_s (stem output) gets a V_{L→s} highway in addition to the 8
+    # block-output highways.
+    res_resnet_highway_include_stem: bool = True
+    # CNN-specific T override. Each inference step on a ResNet-18 is ~100×
+    # more expensive than on the MLP variant, so the MLP default (50) is
+    # wasteful here. 15 is a reasonable starting point; raise via CLI if
+    # convergence suffers.
+    res_resnet_inference_T: int = 30
 
     # Condition number experiment
     cond_width: int = COND_WIDTH
