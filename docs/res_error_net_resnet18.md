@@ -1,131 +1,118 @@
 # `res_error_net_resnet18`
 
-Detailed README for the ResNet-18-based residual-error predictive-coding variant in this repository.
+Code-first README for the ResNet-18 residual-error predictive-coding variant in this repo.
 
-## Overview
+## What This Model Is
 
-`res_error_net_resnet18` is the convolutional, CIFAR-oriented version of the repo's residual-error network idea.
+`res_error_net_resnet18` is the convolutional version of the repo's residual-error network idea. It keeps a real ResNet-style forward backbone, but replaces ordinary one-shot backprop-style credit assignment with iterative predictive-coding inference over hidden activities.
 
-It keeps a genuine ResNet-18-style forward backbone:
+Its distinguishing addition is a set of learnable output-error highways `V_{L→i}` that inject the classifier error directly into earlier activities during inference.
 
-- 1 stem convolution
-- 4 residual stages
-- 2 basic blocks per stage
-- 8 total residual blocks
-- global average pooling
-- linear classifier
+The mental model is:
 
-On top of that forward backbone, it adds a set of learnable **error highways** `V_{L→i}`. Each highway maps the output-layer error directly into an earlier activity tensor, so the model does not rely only on layer-by-layer error transport during predictive-coding inference.
-
-In this implementation, highways can target:
-
-- the stem output
-- every residual block output
-
-That means up to **9 highway target activities** in total:
-
-- stem output
-- block 1 output
-- block 2 output
-- block 3 output
-- block 4 output
-- block 5 output
-- block 6 output
-- block 7 output
-- block 8 output
-
-The classifier output is not itself a highway target; it is the source of the supervisory error signal.
+- forward path: standard ResNet-18-style feature extraction
+- inference path: predictive-coding state updates
+- extra credit path: direct output-error shortcuts into earlier feature maps
 
 ## Why This Variant Exists
 
-Deep predictive-coding models can struggle because the output supervision must influence early layers through iterative dynamics. As the network gets deeper, that signal can weaken or become expensive to recover with many inference steps.
+Deep predictive-coding models have a practical problem: the supervisory signal at the output has to influence early layers through iterative dynamics. As depth grows, this can become slow, weak, or unstable.
 
-This variant tries to help with that by learning direct projections from the output error to intermediate ResNet activities. Conceptually:
+This variant tries to make deep predictive coding more usable by pairing:
 
-- ResNet skip connections help the **forward** information path
-- residual-error highways help the **backward / inference** credit path
+- ResNet residual connections for the forward computation
+- residual-error highways for the backward/inference signal
 
-The goal is not to replace predictive coding with backprop, but to make iterative inference in a deep CNN backbone more usable.
+So the goal is not "a ResNet trained normally", and not "predictive coding with only local adjacent-layer transport", but a hybrid where deep convolutional features still receive a strong global teaching signal during inference.
 
-## Core Idea
+## Forward Architecture
 
-The implementation augments the usual predictive-coding free energy with a highway term:
+The implementation lives in `variants/res_error_net_resnet18.py`.
 
-```text
-F = F_pc + F_highway
-```
-
-where:
-
-```text
-F_pc = Σ_ℓ (1/2) mean ||e^ℓ||²
-```
-
-and the highway contribution is:
-
-```text
-F_highway = α Σ_{i∈S} mean( flatten(z^i) · ( stopgrad(e^L) @ V_i^T ) )
-```
-
-Interpretation:
-
-- `z^i` is the activity at target layer `i`
-- `e^L` is the classifier/output prediction error
-- `V_i` is the learnable highway matrix for target layer `i`
-- `α` controls highway strength
-- `S` is the set of highway target indices
-
-Two details matter a lot in this repo's implementation:
-
-1. The highway term uses the **state** `z^i`, not the local error `e^i`.
-2. `e^L` is wrapped in `stop_gradient`, so the highway term does not directly reshape the penultimate state through gradients flowing backward from the output error term.
-
-That design keeps the last-layer alignment governed by standard predictive-coding error while still letting earlier states feel the output-level signal.
-
-## Architecture
-
-### Forward backbone
-
-The forward model is built in `variants/res_error_net_resnet18.py` and consists of:
+The forward backbone is:
 
 1. `Stem`
-   - `3x3` convolution
+   - `3x3` conv
    - optional DyT normalization
    - activation
-2. `BasicBlock` repeated 8 times
+2. `BasicBlock` repeated across 4 stages
    - conv -> optional DyT -> activation
    - conv -> optional DyT
-   - residual addition
+   - residual add
    - activation
 3. `Head`
-   - global average pooling
-   - linear classifier
+   - global average pooling over spatial dimensions
+   - bias-free linear classifier
 
-Default channel layout:
+All conv and linear layers are created with `use_bias=False`.
 
-```text
-[64, 64, 128, 256, 512]
-```
+### Default layout
 
-This means:
-
-- stem output channels: `64`
-- stage 1 blocks: `64`
-- stage 2 blocks: `128`
-- stage 3 blocks: `256`
-- stage 4 blocks: `512`
-
-Default blocks per stage:
+The default config is:
 
 ```text
-2
+res_resnet_channels = [64, 64, 128, 256, 512]
+res_resnet_blocks_per_stage = 2
+input_shape = (3, 32, 32)
+output_dim = 10
 ```
 
-So the default model is a standard ResNet-18-style layout.
+That gives:
 
-### Highway matrices
+| Activity | Module | Shape by default | Highway target? |
+|---|---|---:|---|
+| `z^0` | stem output | `(64, 32, 32)` | yes, if `highway_include_stem=True` |
+| `z^1` | block 1 output | `(64, 32, 32)` | yes |
+| `z^2` | block 2 output | `(64, 32, 32)` | yes |
+| `z^3` | block 3 output | `(128, 16, 16)` | yes |
+| `z^4` | block 4 output | `(128, 16, 16)` | yes |
+| `z^5` | block 5 output | `(256, 8, 8)` | yes |
+| `z^6` | block 6 output | `(256, 8, 8)` | yes |
+| `z^7` | block 7 output | `(512, 4, 4)` | yes |
+| `z^8` | block 8 output | `(512, 4, 4)` | yes |
+| `z^9` | classifier logits | `(10,)` | no |
 
-For each target activity `z^i`, the code creates a full-rank matrix:
+So the default model has 10 predictive-coding activities total:
+
+- 1 stem activity
+- 8 block activities
+- 1 output activity
+
+`run_training.py` treats this as a fixed-depth architecture. The user-facing `--depths` loop is effectively ignored for this variant, and the effective depth is computed from:
+
+```text
+1 stem + 4 stages * blocks_per_stage + 1 head
+```
+
+With defaults, that is:
+
+```text
+1 + 4*2 + 1 = 10
+```
+
+### ResNet details that matter
+
+- The first block of stages 2, 3, and 4 uses stride 2.
+- When stride or channel count changes, the skip path uses a `1x1` projection conv.
+- Otherwise the skip path is identity.
+- The head pools by simple spatial mean, not max pool.
+- The head returns raw logits.
+
+## What Counts As The State
+
+For this variant, each module returns the post-module activity directly:
+
+- stem returns post-conv, post-norm, post-activation features
+- each basic block returns post-residual, post-activation features
+- the head returns logits
+
+During a plain feedforward pass, the code stores these as `z[0], ..., z[L-1]`.
+
+Those `z` tensors are also the variables that predictive-coding inference updates, except the last one, which is clamped to the target during training-time inference.
+
+## Highway Construction
+
+The core extra parameters are the highway matrices:
 
 ```text
 V_i ∈ R^(D_i × output_dim)
@@ -133,400 +120,426 @@ V_i ∈ R^(D_i × output_dim)
 
 where:
 
-- `D_i` is the flattened size of that activity tensor
-- `output_dim` is the number of classes, usually `10`
+- `D_i` is the flattened size of activity `z^i`
+- `output_dim` is the class dimension
 
-Example:
+Each highway takes output error in class space and projects it into the flattened coordinates of an earlier activity.
 
-- a stem activity of shape `(64, 32, 32)` becomes `D_i = 64 * 32 * 32`
-- the corresponding `V_i` maps from class-space error to that flattened feature space
-
-This is expressive, but also expensive in memory compared with narrow feedback projections.
-
-## Normalization Choice: DyT Instead of BatchNorm
-
-This variant intentionally does **not** use BatchNorm.
-
-Instead it supports:
-
-- `dyt`
-- `none`
-
-DyT here is:
+With default CIFAR-10 shapes and `highway_include_stem=True`, the total flattened target size is:
 
 ```text
-DyT(x) = γ ⊙ tanh(αx) + β
+3*(64*32*32) + 2*(128*16*16) + 2*(256*8*8) + 2*(512*4*4) = 311,296
 ```
 
-applied per channel.
+So the default highway bank has:
 
-The reason is practical: predictive-coding inference performs multiple iterative state updates per batch. BatchNorm's running statistics are a poor fit for that loop, because the states seen during iterative inference do not behave like ordinary single-pass feedforward activations. DyT is stateless and per-example, so it stays consistent across inference steps.
+```text
+311,296 * 10 = 3,112,960
+```
 
-## Training / Inference Procedure
+learnable `V` parameters.
 
-This variant is trained by `training/res_error_net_trainer.py`.
+That is one of the main design tradeoffs in this model:
 
-Per batch, the procedure is:
+- advantage: full-rank, very expressive direct error routing
+- cost: nontrivial memory footprint, especially in early high-resolution layers
 
-1. Feedforward initialize all layer states.
-2. Clamp the output state to the target labels.
-3. Run `T` Euler inference steps on the free states.
-4. Compute converged prediction errors.
-5. Compute `ΔW` for model parameters.
-6. Compute `ΔV` for the highway matrices.
-7. Optionally re-project updates to a Gaussian ball.
-8. Apply updates with Adam, AdamW, or SGD.
+## Free Energy And Loss
+
+The code optimizes an augmented predictive-coding free energy:
+
+```text
+F(z; W, V) = F_pc(z; W) + F_highway(z; V)
+```
+
+with:
+
+```text
+F_pc = Σ_l 1/2 * mean(||e^l||_2^2)
+```
+
+and:
+
+```text
+F_highway = α Σ_{i∈S} mean( flatten(z^i) · ( stopgrad(e^L) @ V_i^T ) )
+```
+
+Here:
+
+- `e^l = z^l - μ^l`
+- `μ^l` is the model prediction for layer `l`
+- `S` is the set of highway target indices
+- `α` is the highway strength
+- `e^L` is the output-layer prediction error after clamping the output activity to the target
+
+In the code, layers are indexed `0 ... L-1`, so the mathematical `e^L` here corresponds to `e[L-1]`.
+
+### Predictions and errors
+
+Given hidden states `z` and input `x`, the model computes:
+
+```text
+μ^0 = stem(x)
+μ^l = block_l(z^{l-1})   for hidden blocks
+μ^{L-1} = head(z^{L-2})
+e^l = z^l - μ^l
+```
+
+In `compute_errors(...)`, the code explicitly replaces the final state with the target before computing errors:
+
+```text
+z^{L-1} := y
+```
+
+So the output error is always measured against a hard-clamped target during inference/training updates.
+
+### Important design detail: the highway term uses `z^i`, not `e^i`
+
+This is easy to miss if you only skim comments elsewhere in the repo.
+
+In the executable code:
+
+- the highway energy depends on `z^i`
+- the default `V` update rule also depends on `z^i`
+
+It does not use the local hidden-layer error `e^i`.
+
+### Important design detail: `e^L` is wrapped in `stop_gradient`
+
+The highway term uses:
+
+```text
+stop_gradient(e^L)
+```
+
+This has two important consequences:
+
+1. The highway term does not differentiate through the output-error computation itself.
+2. During weight updates, `F_highway` contributes zero gradient to the forward model parameters `W`, because `z` is treated as fixed and the only remaining dependence on `W` through `e^L` is stopped.
+
+So:
+
+- `F_highway` changes hidden-state inference
+- `F_highway` updates `V`
+- `F_highway` does not directly update forward weights `W`
+
+That is a very deliberate separation of roles.
 
 ## Inference Dynamics
 
-Inference updates the hidden states by gradient descent on the augmented free energy:
+Training-time inference solves for hidden activities while keeping the output clamped:
 
 ```text
-z <- z - dt * ∂F/∂z
+z_free <- argmin_z F(z; W, V)
 ```
 
-The implementation does this with autodiff over the free states and runs the loop with a JIT-compiled `jax.lax.scan` when energy logging is disabled.
+The actual implementation uses iterative gradient-based updates on the free states.
 
-Important consequences:
+### Euler inference
 
-- larger `T` gives states more time to settle
-- larger `dt` makes inference more aggressive, but can destabilize it
-- larger `α` increases the effect of output-error highways on hidden states
+The default update is:
 
-The ResNet-18 variant is much more expensive per inference step than the MLP version, which is why it has its own `res_resnet_inference_T` setting.
+```text
+z^i <- z^i - dt * ∂F/∂z^i
+```
+
+for all free layers `i = 0, ..., L-2`.
+
+The output layer is always:
+
+```text
+z^{L-1} = y
+```
+
+### Adam-on-z inference
+
+The code also supports:
+
+```text
+inference_method = "adam"
+```
+
+In that mode, hidden states are still optimized against the same free energy, but each coordinate gets Adam-style first/second-moment adaptation. In this mode `dt` acts like the inference learning rate.
+
+### Practical meaning of the main inference knobs
+
+- `res_resnet_alpha`: how strongly the highways influence hidden-state inference
+- `res_resnet_inference_dt`: step size for Euler, or learning rate for Adam-on-z
+- `res_resnet_inference_T`: number of inference steps per batch
+- `res_resnet_inference_method`: `"euler"` or `"adam"`
+
+Because each step runs a full ResNet-18-like computation inside predictive-coding inference, this variant is far more expensive per step than the MLP version. That is why it has its own lower default `T`.
 
 ## Parameter Updates
 
-### Model-parameter updates (`W`)
+After inference settles the hidden states, the trainer computes two kinds of updates.
 
-`compute_W_updates` differentiates the model energy with respect to the learnable model parameters:
+### Forward-parameter updates `ΔW`
 
-- convolution weights
-- linear weights
-- DyT parameters (`alpha`, `gamma`, `beta`) when DyT is enabled
+`compute_W_updates(...)` differentiates the augmented energy with respect to the forward model leaves:
 
-There is also a fused path, `compute_updates_fused`, which computes:
+- conv weights
+- head linear weights
+- DyT parameters when enabled
 
-- errors
+Even though the code calls the augmented energy, the `stop_gradient(e^L)` design means the highway term contributes zero direct gradient to `W`. In effect, `ΔW` is the predictive-coding weight gradient evaluated at the inferred states.
+
+### Highway updates `ΔV`
+
+For each highway target `i`, the code forms a batch average outer product between flattened state `z^i` and output error `e^L`.
+
+Default rule:
+
+```text
+rule = "energy"
+ΔV_i = α * (1/B) Σ_b z^i_b (e^L_b)^T
+```
+
+Alternative rule:
+
+```text
+rule = "state"
+ΔV_i = -α * (1/B) Σ_b z^i_b (e^L_b)^T
+```
+
+If `v_reg > 0`, the code adds:
+
+```text
+v_reg * V_i
+```
+
+to each update. This acts like an L2 penalty and helps keep `V` bounded.
+
+### Fused update path
+
+The variant also implements `compute_updates_fused(...)`, which returns:
+
+- `e`
 - `ΔW`
 - `ΔV`
 - per-layer energies
 
-in one JITted pass to avoid redundant forward/backward work.
+from one JITted pass.
 
-### Highway updates (`V`)
+This is an implementation optimization, not a different algorithm.
 
-The code currently supports two rules:
+## Training Loop
 
-#### `energy`
+The training loop is in `training/res_error_net_trainer.py`.
+
+Per batch it does:
+
+1. load a minibatch
+2. optionally add Gaussian input noise
+3. run a feedforward pass to initialize `z`
+4. clamp the output activity to the target
+5. run `T` inference steps on hidden states
+6. compute `ΔW` and `ΔV`
+7. optionally reproject each update leaf into a Gaussian ball
+8. apply global-norm clipping to `ΔW`
+9. apply optimizer updates
+10. log feedforward loss and accuracy after the parameter update
+
+### Stabilization choices in the trainer
+
+- `reproject_c`: optional per-leaf reprojection for both `ΔW` and `ΔV`
+- `global_clip_norm`: global norm clipping on `ΔW`
+- `weight_decay`: used by AdamW when selected
+- `input_noise_sigma`: optional Gaussian noise on inputs
+
+The code comments explicitly note that for res-error-net experiments, global clipping is usually preferable to per-leaf reprojection because it preserves relative gradient magnitudes better.
+
+## Reported Loss Versus Training Objective
+
+This is another subtle but important point.
+
+The actual training objective is the predictive-coding free energy above, minimized indirectly by:
+
+- inferring hidden states
+- then updating `W` and `V`
+
+The `loss_type` setting (`"mse"` or `"ce"`) is only used for reporting:
+
+- train loss is measured on a fresh feedforward pass after the update
+- test accuracy is measured on a plain feedforward pass
+- inference diagnostics compute loss/accuracy on `μ^{L-1} = head(z^{L-2})`, not on the clamped output state
+
+So `res_resnet_loss` changes logging/evaluation, not the core predictive-coding training rule.
+
+## Why DyT Is Used Instead Of BatchNorm
+
+This variant supports:
+
+- `normalization="dyt"`
+- `normalization="none"`
+
+DyT is:
 
 ```text
-ΔV_i = α * z^i * (e^L)^T / B
+DyT(x) = gamma * tanh(alpha * x) + beta
 ```
 
-where `z^i` is flattened and batch-averaged.
+with:
 
-This is the default in the codebase.
+- scalar `alpha`
+- per-channel `gamma`
+- per-channel `beta`
 
-#### `state`
+The reason BatchNorm is avoided is architectural, not cosmetic:
 
-```text
-ΔV_i = -α * z^i * (e^L)^T / B
-```
+- predictive-coding inference updates states repeatedly inside a single batch
+- those evolving states do not match the assumptions behind running batch statistics
+- a stateless per-example normalization is much easier to keep consistent across inference steps
 
-This is kept as an ablation / alternative rule.
+So DyT is part of the model's training dynamics story, not just a normalization swap.
 
-### Update re-projection
+## Main Design Choices And Their Consequences
 
-Both `ΔW` and `ΔV` can be reprojected to a Gaussian ball using the same helper used by related variants in this repo. This is a stabilization measure and is controlled by `--reproject-c`.
+### 1. Real ResNet forward path
 
-## Repo Defaults
+Using actual residual blocks gives a strong convolutional backbone instead of a toy CNN or MLP. The variant is trying to test residual-error predictive coding in a serious deep vision model.
 
-The current code defaults come from `config.py` and the variant implementation.
+### 2. Full-rank output-error highways
 
-### Variant-specific defaults
+Each targeted activity gets a dense projection from output error into its flattened coordinates. This maximizes flexibility, but it is expensive.
 
-| Setting | Current default |
+### 3. Hard output clamp
+
+The output activity is replaced by the target during inference. This makes the supervisory signal explicit and keeps the inference problem close to standard predictive-coding formulations.
+
+### 4. Highway energy acts on states, not local errors
+
+This means highways nudge the hidden activities themselves rather than transporting a local error object.
+
+### 5. `stop_gradient` on the output error
+
+This prevents the highway term from becoming a direct auxiliary loss on forward weights. The highways modify inference and learn their own projections, but do not directly rewrite the `W` update rule.
+
+### 6. DyT instead of BatchNorm
+
+The normalization choice is tailored to iterative inference, not standard feedforward training.
+
+### 7. Separate inference optimizer
+
+Allowing Euler or Adam-on-z makes inference itself a tunable optimization process. This is useful because stability of hidden-state settling is a major bottleneck in deep predictive-coding models.
+
+## Default Config Surface
+
+Important defaults from `config.py` for this variant:
+
+| Setting | Default |
 |---|---|
-| `variant` | `res_error_net_resnet18` |
-| `dataset` | usually used with `CIFAR10` |
-| `res_alpha` | `1.0` |
-| `res_inference_dt` | `0.1` |
-| `res_v_lr` | `1e-4` |
-| `res_v_update_rule` | `energy` |
-| `res_v_reg` | `0.0` |
-| `res_optim` | `adamw` |
-| `res_loss` | `mse` |
-| `reproject_c` | `1.0` |
-| `input_noise_sigma` | `0.1` |
-| `weight_decay` | `1e-4` |
-
-### ResNet-18-specific defaults
-
-| Setting | Current default |
-|---|---|
+| `dataset` | `CIFAR10` is the intended use case |
+| `res_resnet_alpha` | `1.0` |
 | `res_resnet_channels` | `[64, 64, 128, 256, 512]` |
 | `res_resnet_blocks_per_stage` | `2` |
 | `res_resnet_normalization` | `dyt` |
 | `res_resnet_dyt_init_alpha` | `0.5` |
 | `res_resnet_highway_include_stem` | `True` |
+| `res_resnet_inference_dt` | `0.1` |
 | `res_resnet_inference_T` | `30` |
-| `res_v_init_scale` used by this variant | `0.01` in `create_model(...)` unless overridden |
+| `res_resnet_inference_method` | `"euler"` |
+| `res_resnet_v_lr` | `1e-4` |
+| `res_resnet_v_update_rule` | `"energy"` |
+| `res_resnet_v_init_scale` | `0.01` |
+| `res_resnet_optim` | `"adamw"` |
+| `res_resnet_loss` | `"mse"` |
+| `res_resnet_v_reg` | `0.1` |
+| `reproject_c` | `1.0` |
+| `global_clip_norm` | `10.0` |
+| `input_noise_sigma` | `0.1` |
+| `weight_decay` | `1e-4` |
 
-## Important Note About a CLI Help Mismatch
-
-`run_training.py` currently advertises:
-
-- `--res-resnet-inference-T` default: `15`
-
-But `config.py` currently sets:
-
-- `res_resnet_inference_T = 30`
-
-So if you rely on the code rather than the help text, the effective repo default is **30** unless explicitly overridden on the command line.
-
-## Command-Line Flags
-
-The main entry point is `run_training.py`.
-
-### Common training flags
+Useful CLI flags in `run_training.py`:
 
 ```bash
---variant
---dataset
---depths
---act-fns
---n-iters
---seed
---batch-size
---param-lr
---test-every
---no-wandb
-```
-
-### Residual-error flags
-
-```bash
---res-alpha
---res-inference-T
---res-inference-dt
---res-v-lr
---res-v-update-rule
---res-v-init-scale
---res-optim
---res-loss
---res-v-reg
---reproject-c
---input-noise-sigma
---weight-decay
-```
-
-### ResNet-18-specific flags
-
-```bash
+--variant res_error_net_resnet18
+--dataset CIFAR10
+--res-resnet-alpha
 --res-resnet-channels
 --res-resnet-blocks-per-stage
 --res-resnet-normalization
 --res-resnet-dyt-init-alpha
 --res-resnet-no-stem-highway
+--res-resnet-inference-dt
 --res-resnet-inference-T
+--res-resnet-inference-method
+--res-resnet-v-lr
+--res-resnet-v-update-rule
+--res-resnet-v-init-scale
+--res-resnet-optim
+--res-resnet-loss
+--res-resnet-v-reg
+--reproject-c
+--global-clip-norm
+--input-noise-sigma
+--weight-decay
 ```
 
-## How To Run It
+## Evaluation And Diagnostics
 
-### Minimal example
+`evaluate(...)` uses a plain feedforward pass and reports top-1 accuracy from the logits.
 
-```bash
-python run_training.py \
-  --variant res_error_net_resnet18 \
-  --dataset CIFAR10 \
-  --depths 1 \
-  --act-fns relu \
-  --n-iters 100 \
-  --batch-size 32 \
-  --test-every 5 \
-  --no-wandb
-```
+So the headline test metric in training logs is:
 
-Why `--depths 1`?
+- feedforward accuracy of the learned model
+- not clamped-inference accuracy
 
-For this variant, the ResNet-18 layout is fixed inside the variant itself. The external `depth` loop still exists because the training script expects it, but the variant's `create_model` ignores `depth` and `width`.
+The variant also exposes `diagnose_inference(...)`, which tracks:
 
-### Baseline-style CIFAR-10 run
+- free energy across inference steps
+- loss across inference steps
+- accuracy across inference steps
 
-```bash
-python run_training.py \
-  --variant res_error_net_resnet18 \
-  --dataset CIFAR10 \
-  --depths 1 \
-  --act-fns relu \
-  --seed 42 \
-  --n-iters 200 \
-  --batch-size 32 \
-  --test-every 5 \
-  --param-lr 1e-4 \
-  --res-v-lr 1e-4 \
-  --res-alpha 1.0 \
-  --res-inference-dt 0.1 \
-  --res-resnet-inference-T 30 \
-  --res-v-update-rule energy \
-  --res-optim adamw \
-  --res-loss mse \
-  --res-resnet-normalization dyt \
-  --res-resnet-dyt-init-alpha 0.5 \
-  --no-wandb
-```
-
-### Ablations worth running
-
-#### Remove stem highway
-
-```bash
-python run_training.py \
-  --variant res_error_net_resnet18 \
-  --dataset CIFAR10 \
-  --depths 1 \
-  --act-fns relu \
-  --res-resnet-no-stem-highway \
-  --no-wandb
-```
-
-#### Disable DyT
-
-```bash
-python run_training.py \
-  --variant res_error_net_resnet18 \
-  --dataset CIFAR10 \
-  --depths 1 \
-  --act-fns relu \
-  --res-resnet-normalization none \
-  --no-wandb
-```
-
-#### Compare highway learning rules
-
-```bash
-python run_training.py \
-  --variant res_error_net_resnet18 \
-  --dataset CIFAR10 \
-  --depths 1 \
-  --act-fns relu \
-  --res-v-update-rule energy \
-  --no-wandb
-
-python run_training.py \
-  --variant res_error_net_resnet18 \
-  --dataset CIFAR10 \
-  --depths 1 \
-  --act-fns relu \
-  --res-v-update-rule state \
-  --no-wandb
-```
-
-#### Change inference budget
-
-```bash
-python run_training.py \
-  --variant res_error_net_resnet18 \
-  --dataset CIFAR10 \
-  --depths 1 \
-  --act-fns relu \
-  --res-resnet-inference-T 10 \
-  --res-inference-dt 0.1 \
-  --no-wandb
-```
-
-## Outputs
-
-Runs are saved under:
+Those diagnostics compute prediction quality from:
 
 ```text
-results/res_error_net_resnet18/
+μ^{L-1} = head(z^{L-2})
 ```
 
-For a given activation/depth combination, the training script writes:
+because the actual output activity is clamped and would otherwise give a trivial perfect score.
 
-- raw metric arrays as `.npy`
-- plots such as performance and train-loss curves
+## Practical Caveats
 
-Typical log lines look like:
+### Runtime
 
-```text
-Iter 20, loss=..., train acc=..., test acc=...
-```
+This variant is expensive. Every training batch includes a forward initialization plus many predictive-coding inference steps through a ResNet-like backbone.
 
-The training script evaluates with a plain feedforward pass at test time, not with clamped iterative inference.
+### Memory
 
-## Evaluation Behavior
+The `V` matrices are largest exactly where spatial resolution is highest, so early highways are the main memory cost.
 
-`evaluate(...)` in the variant:
+### Sensitivity
 
-- runs a normal forward pass
-- uses the final classifier logits
-- computes top-1 accuracy
+The model is sensitive to:
 
-So the reported test accuracy is the standard feedforward accuracy of the learned model.
+- inference step count
+- inference step size
+- highway strength
+- choice of inference optimizer
+- stabilization settings such as clipping and `V` regularization
 
-## Things To Watch Out For
+### Documentation subtlety
 
-### 1. This variant is expensive
-
-A ResNet-18 backbone inside iterative predictive-coding inference is much heavier than the MLP variants. Increasing `T` can quickly multiply runtime.
-
-### 2. Highway matrices can be large
-
-Because each `V_i` is full-rank in flattened feature space, memory usage can rise noticeably, especially for early high-resolution layers.
-
-### 3. `depth` does not mean network depth here
-
-The script still loops over `--depths`, but the variant internally uses a fixed ResNet-18 topology. In practice, use `--depths 1` for this variant.
-
-### 4. CLI help is not perfectly synced with config defaults
-
-The `res_resnet_inference_T` mismatch mentioned above is the clearest example. When in doubt, trust the actual config and variant code.
-
-### 5. The implementation comments and formulas are not perfectly aligned everywhere
-
-The top-of-file docstring and some trainer comments describe the highway and `V` update rule in slightly different terms from the executable code. The most reliable source is the actual implementation:
+Some comments elsewhere in the repo use older wording for the `V` update rule. The implementation in `variants/res_error_net_resnet18.py` is the authoritative behavior:
 
 - highway energy uses `z^i`
-- `compute_V_updates(..., rule="energy")` also uses `z^i`
+- default `ΔV` uses `z^i` and `e^L`
+- `stop_gradient(e^L)` is part of the design
 
-If you plan to write a paper or report from this variant, it is worth re-deriving the exact update equations from the final code rather than relying only on comments.
+## Minimal Mental Model
 
-## Recommended First Experiments
+If you want the shortest accurate summary, it is this:
 
-If you are trying to understand whether the variant is working, these are good first checks:
-
-1. Compare `energy` vs `state` V updates.
-2. Compare `dyt` vs `none`.
-3. Compare stem-highway enabled vs disabled.
-4. Sweep `res_alpha` over a small range such as `0.05, 0.1, 0.3, 1.0`.
-5. Sweep `res_resnet_inference_T` over `5, 10, 20, 30`.
-6. Watch for divergence or degradation in the logs.
+`res_error_net_resnet18` is a CIFAR-scale ResNet-18-style predictive-coding model where hidden convolutional states are iteratively inferred under an energy objective, while a bank of learnable dense highways projects output error directly into the stem and residual-block activities to improve long-range credit assignment.
 
 ## Implementation Map
 
-Main files for this variant:
-
 - `variants/res_error_net_resnet18.py`
-  ResNet-18 backbone, highway definitions, inference dynamics, update rules, evaluation.
+  Forward architecture, free energy, inference, `V` updates, evaluation, diagnostics.
 - `training/res_error_net_trainer.py`
-  Training loop for residual-error variants, including this one.
+  Training loop, stabilization logic, optimizer application, logging.
 - `run_training.py`
-  CLI entry point, config overrides, dispatch to the trainer.
+  CLI wiring and variant-specific config plumbing.
 - `config.py`
-  Global defaults, including the ResNet-18-specific settings.
-- `program_res_error_net.md`
-  Search notes and experiment strategy for this variant family.
-
-## Summary
-
-`res_error_net_resnet18` is a deep predictive-coding CNN that combines:
-
-- a ResNet-18-style forward architecture
-- iterative predictive-coding inference
-- learnable output-error highways into early and intermediate feature maps
-- DyT normalization to keep the inference loop stateless
-
-It is one of the more ambitious variants in this repository: more expressive than the MLP residual-error model, but also heavier and more sensitive to inference/training hyperparameters. If you treat it as a CIFAR-10 ResNet-18 backbone with predictive-coding state inference plus direct error-routing highways, you will have the right mental model.
+  Defaults for channels, inference budget, optimizer, regularization, and normalization.

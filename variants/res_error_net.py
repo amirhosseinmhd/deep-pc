@@ -5,19 +5,26 @@ the output error e^L directly back to hidden layer i, analogous to ResNet
 skip connections but on the backward/error pathway. Addresses the vanishing
 error signal problem in deep PC networks.
 
-Augmented free energy (from friend's derivation):
-    F = Σ_ℓ (1/2)‖e^ℓ‖²  +  Σ_ℓ α (e^ℓ)ᵀ V_{L→ℓ} e^L
+Augmented free energy:
+    F = Σ_ℓ (1/2)·mean‖e^ℓ‖²
+      + α · Σ_{i∈S} mean( z^i · ( sg(e^L) @ V_{L→i}ᵀ ) )
+
+The highway factor is the *state* z^i (not the local error e^i), and e^L is
+wrapped in stop_gradient — so F_hw has no influence on z^{L-1} during
+inference (the last free layer aligns to the clamped target via F_pc only)
+and contributes 0 to ∂F/∂W.
 
 Inference dynamics (Euler on dF/dz):
     ż^i = -∂F/∂z^i   for i ∈ {0, …, L-2};  z^{L-1} hard-clamped to y
 
 V update rules (config flag):
-    "energy": ΔV_{L→i} = α e^i (e^L)ᵀ        (derived from ∂F/∂V)
-    "state" : ΔV_{L→i} = -α z^i (e^L)ᵀ       (original Hebbian sketch, stored
+    "energy": ΔV_{L→i} = +α z^i (e^L)ᵀ       (derived from ∂F_hw/∂V)
+    "state" : ΔV_{L→i} = -α z^i (e^L)ᵀ       (Hebbian anti-gradient, stored
                                               negated so optax subtraction
-                                              yields +α z^i (e^L)ᵀ step)
-W updates: standard PC gradient on F_pc (highway term ignored per friend's
-note — "W update rule is unchanged").
+                                              yields +α z^i (e^L)ᵀ growth)
+
+W update: standard PC gradient on F_pc — F_hw contributes 0 to ∂F/∂W under
+the new energy.
 """
 
 import jax
@@ -45,6 +52,64 @@ def _jit_inference_scan(variant, bundle, z_init, x_batch, y_batch, alpha, dt, T)
         return new_z, None
     z_out, _ = jax.lax.scan(body, z_init, None, length=T)
     return z_out
+
+
+@eqx.filter_jit
+def _jit_inference_scan_adam(variant, bundle, z_init, x_batch, y_batch,
+                             alpha, lr, T, b1, b2, eps):
+    """T-step Adam-on-z scan. Maintains per-element first/second moments of
+    ∂F/∂z and applies the bias-corrected Adam update each step."""
+    L = bundle["depth"]
+    z_free = [z_init[l] for l in range(L - 1)]
+    m0 = [jnp.zeros_like(zl) for zl in z_free]
+    v0 = [jnp.zeros_like(zl) for zl in z_free]
+    t0 = jnp.zeros((), dtype=jnp.int32)
+
+    def body(carry, _):
+        zf, m, v, t = carry
+        grads = jax.grad(
+            lambda zfree: variant.free_energy_z(
+                zfree, bundle, x_batch, y_batch, alpha
+            )
+        )(zf)
+        t_new = t + 1
+        m_new = [b1 * m[i] + (1.0 - b1) * grads[i] for i in range(len(zf))]
+        v_new = [b2 * v[i] + (1.0 - b2) * grads[i] ** 2 for i in range(len(zf))]
+        bc1 = 1.0 - b1 ** t_new
+        bc2 = 1.0 - b2 ** t_new
+        zf_new = [
+            zf[i] - lr * (m_new[i] / bc1) / (jnp.sqrt(v_new[i] / bc2) + eps)
+            for i in range(len(zf))
+        ]
+        return (zf_new, m_new, v_new, t_new), None
+
+    (zf_final, _, _, _), _ = jax.lax.scan(
+        body, (z_free, m0, v0, t0), None, length=T
+    )
+    return zf_final + [y_batch]
+
+
+@eqx.filter_jit
+def _jit_inference_step_adam(variant, bundle, z, m, v, t, x_batch, y_batch,
+                             alpha, lr, b1, b2, eps):
+    """One Adam-on-z step. Public so the diagnostic loop can drive it."""
+    L = bundle["depth"]
+    zf = [z[l] for l in range(L - 1)]
+    grads = jax.grad(
+        lambda zfree: variant.free_energy_z(
+            zfree, bundle, x_batch, y_batch, alpha
+        )
+    )(zf)
+    t_new = t + 1
+    m_new = [b1 * m[i] + (1.0 - b1) * grads[i] for i in range(len(zf))]
+    v_new = [b2 * v[i] + (1.0 - b2) * grads[i] ** 2 for i in range(len(zf))]
+    bc1 = 1.0 - b1 ** t_new
+    bc2 = 1.0 - b2 ** t_new
+    zf_new = [
+        zf[i] - lr * (m_new[i] / bc1) / (jnp.sqrt(v_new[i] / bc2) + eps)
+        for i in range(len(zf))
+    ]
+    return zf_new + [y_batch], m_new, v_new, t_new
 
 
 @eqx.filter_jit
@@ -85,10 +150,18 @@ class ResErrorNetVariant:
         input_dim = kwargs.get("input_dim", _DEFAULT_INPUT_DIM)
         output_dim = kwargs.get("output_dim", _DEFAULT_OUTPUT_DIM)
         highway_every_k = kwargs.get("highway_every_k", 2)
+        forward_skip_every = kwargs.get("forward_skip_every", 0)
         v_init_scale = kwargs.get("v_init_scale", 0.01)
         # "unit_gaussian" mirrors rec-LRA paper (p.16); "jpc_default" keeps
         # the 1/√fan_in scale which is stable without ZCA preprocessing.
         init_scheme = kwargs.get("res_init_scheme", "jpc_default")
+        # "euler" (plain gradient flow) or "adam" (per-coordinate adaptive
+        # step size on z). Adam treats `dt` as a learning rate and is far
+        # less sensitive to its value.
+        inference_method = kwargs.get("inference_method", "euler")
+        inference_b1 = kwargs.get("inference_b1", 0.9)
+        inference_b2 = kwargs.get("inference_b2", 0.999)
+        inference_eps = kwargs.get("inference_eps", 1e-8)
 
         key, subkey = jr.split(key)
         model = jpc.make_mlp(
@@ -128,12 +201,17 @@ class ResErrorNetVariant:
             "V_list": V_list,
             "highway_indices": S,
             "highway_every_k": highway_every_k,
+            "forward_skip_every": forward_skip_every,
             "v_init_scale": v_init_scale,
             "init_scheme": init_scheme,
             "act_fn": act_fn_callable,
             "act_fn_name": act_fn,
             "depth": depth,
             "dims": dims,
+            "inference_method": inference_method,
+            "inference_b1": inference_b1,
+            "inference_b2": inference_b2,
+            "inference_eps": inference_eps,
         }
 
     @staticmethod
@@ -177,9 +255,19 @@ class ResErrorNetVariant:
 
     # --- Forward / predictions / errors ---
 
+    @staticmethod
+    def _add_forward_skip(pred, z_hist, layer_idx, forward_skip_every):
+        if forward_skip_every <= 0 or layer_idx < forward_skip_every:
+            return pred
+        src = z_hist[layer_idx - forward_skip_every]
+        if src is None or src.shape[-1] != pred.shape[-1]:
+            return pred
+        return pred + src
+
     def forward_pass(self, bundle, x_batch):
         model = bundle["model"]
         act_fn = bundle["act_fn"]
+        n = bundle.get("forward_skip_every", 0)
         L = bundle["depth"]
 
         z = [None] * L
@@ -187,28 +275,35 @@ class ResErrorNetVariant:
         z_prev = x_batch
         for l in range(L):
             h[l] = vmap(model[l])(z_prev)
-            z[l] = vmap(act_fn)(h[l]) if l < L - 1 else h[l]
+            z_pred = vmap(act_fn)(h[l]) if l < L - 1 else h[l]
+            z[l] = self._add_forward_skip(z_pred, z, l, n)
             z_prev = z[l]
         return z, h
 
     @staticmethod
-    def _predictions_and_errors(model, z_list, x_batch, act_fn, L):
+    def _predictions_and_errors(model, z_list, x_batch, act_fn, L, forward_skip_every=0):
         mu = [None] * L
         h = [None] * L
         for l in range(L):
             prev = x_batch if l == 0 else z_list[l - 1]
             h[l] = vmap(model[l])(prev)
-            mu[l] = vmap(act_fn)(h[l]) if l < L - 1 else h[l]
+            mu_pred = vmap(act_fn)(h[l]) if l < L - 1 else h[l]
+            mu[l] = ResErrorNetVariant._add_forward_skip(
+                mu_pred, z_list, l, forward_skip_every
+            )
         e = [z_list[l] - mu[l] for l in range(L)]
         return e, mu, h
 
     def compute_errors(self, bundle, z, x_batch, y_batch):
         model = bundle["model"]
         act_fn = bundle["act_fn"]
+        n = bundle.get("forward_skip_every", 0)
         L = bundle["depth"]
         z_list = list(z)
         z_list[L - 1] = y_batch
-        e, _, _ = self._predictions_and_errors(model, z_list, x_batch, act_fn, L)
+        e, _, _ = self._predictions_and_errors(
+            model, z_list, x_batch, act_fn, L, n
+        )
         return e
 
     # --- Energy ---
@@ -218,27 +313,33 @@ class ResErrorNetVariant:
         return sum(0.5 * jnp.mean(jnp.sum(el ** 2, axis=1)) for el in e_list)
 
     @staticmethod
-    def _F_highway(e_list, V_list, S, alpha, L):
+    def _F_highway(z_list, e_list, V_list, S, alpha, L):
         if not S:
             return jnp.array(0.0)
-        e_L = e_list[L - 1]
+        # stop_grad on e^L: highway no longer pulls z^{L-1} during inference;
+        # z^{L-1} is shaped only by F_pc (i.e., aligns to the clamped target).
+        e_L = jax.lax.stop_gradient(e_list[L - 1])
         total = jnp.array(0.0)
         for idx, i in enumerate(S):
             Vi = V_list[idx]
-            e_i = e_list[i]
-            total = total + alpha * jnp.mean(jnp.sum(e_i * (e_L @ Vi.T), axis=1))
+            z_i = z_list[i]
+            shortcut = e_L @ Vi.T
+            total = total + alpha * jnp.mean(jnp.sum(z_i * shortcut, axis=1))
         return total
 
     def free_energy_z(self, z_free, bundle, x_batch, y_batch, alpha):
         model = bundle["model"]
         act_fn = bundle["act_fn"]
+        n = bundle.get("forward_skip_every", 0)
         L = bundle["depth"]
         S = bundle["highway_indices"]
         V_list = bundle["V_list"]
 
         z_list = list(z_free) + [y_batch]
-        e, _, _ = self._predictions_and_errors(model, z_list, x_batch, act_fn, L)
-        return self._F_pc(e) + self._F_highway(e, V_list, S, alpha, L)
+        e, _, _ = self._predictions_and_errors(
+            model, z_list, x_batch, act_fn, L, n
+        )
+        return self._F_pc(e) + self._F_highway(z_list, e, V_list, S, alpha, L)
 
     # --- Inference dynamics ---
 
@@ -256,38 +357,62 @@ class ResErrorNetVariant:
     def run_inference(self, bundle, x_batch, y_batch, alpha, dt, T,
                       z_init=None, record_energy=False):
         L = bundle["depth"]
+        method = bundle.get("inference_method", "euler")
+        b1 = bundle.get("inference_b1", 0.9)
+        b2 = bundle.get("inference_b2", 0.999)
+        eps = bundle.get("inference_eps", 1e-8)
         if z_init is None:
             z_init, _ = self.forward_pass(bundle, x_batch)
         z = list(z_init)
         z[L - 1] = y_batch
 
         if not record_energy:
-            z = _jit_inference_scan(
-                self, bundle, z, x_batch, y_batch, alpha, dt, T
-            )
+            if method == "adam":
+                z = _jit_inference_scan_adam(
+                    self, bundle, z, x_batch, y_batch, alpha, dt, T,
+                    b1, b2, eps,
+                )
+            else:
+                z = _jit_inference_scan(
+                    self, bundle, z, x_batch, y_batch, alpha, dt, T
+                )
             return z, None
 
         # Diagnostic path (used by diagnose_*.py scripts) — keep eager so we
         # can sync per-step free-energy without breaking trace.
         energies = []
-        for _ in range(T):
-            z = self.inference_step(bundle, z, x_batch, y_batch, alpha, dt)
-            z_free = [z[l] for l in range(L - 1)]
-            energies.append(float(
-                self.free_energy_z(z_free, bundle, x_batch, y_batch, alpha)
-            ))
+        if method == "adam":
+            m = [jnp.zeros_like(z[l]) for l in range(L - 1)]
+            v = [jnp.zeros_like(z[l]) for l in range(L - 1)]
+            t_count = jnp.zeros((), dtype=jnp.int32)
+            for _ in range(T):
+                z, m, v, t_count = _jit_inference_step_adam(
+                    self, bundle, z, m, v, t_count,
+                    x_batch, y_batch, alpha, dt, b1, b2, eps,
+                )
+                z_free = [z[l] for l in range(L - 1)]
+                energies.append(float(
+                    self.free_energy_z(z_free, bundle, x_batch, y_batch, alpha)
+                ))
+        else:
+            for _ in range(T):
+                z = self.inference_step(bundle, z, x_batch, y_batch, alpha, dt)
+                z_free = [z[l] for l in range(L - 1)]
+                energies.append(float(
+                    self.free_energy_z(z_free, bundle, x_batch, y_batch, alpha)
+                ))
         return z, energies
 
     # --- Parameter updates ---
 
     def compute_W_updates(self, bundle, z, x_batch, y_batch):
-        """∂F_aug/∂W^l via autodiff, where F_aug = F_pc + F_highway.
+        """∂F_aug/∂W^l via autodiff.
 
-        Differentiating F_highway wrt W^l gives a ResNet-style shortcut
-        α·(V_l e^L)⊙act'(h^l) ⊗ z^{l-1} for every l in the highway set S —
-        this is the direct output-error signal into each highway-connected
-        layer. Earlier versions dropped this term ('W update unchanged')
-        which reproduced standard PC's vanishing signal at depth.
+        Under the new highway energy F_hw = α·Σ z^i·(sg(e^L) @ V_iᵀ), z is
+        constant w.r.t. model params and stop_gradient blocks flow through
+        e^L, so F_hw contributes 0 to ∂F/∂W. The W update therefore
+        reduces to ∂F_pc/∂W (we still go through the augmented closure for
+        symmetry with free_energy_z and to keep the API uniform).
         """
         model = bundle["model"]
         act_fn = bundle["act_fn"]
@@ -303,7 +428,7 @@ class ResErrorNetVariant:
             e, _, _ = self._predictions_and_errors(model_, z_list, x_batch, act_fn, L)
             f = self._F_pc(e)
             if alpha is not None and S:
-                f = f + self._F_highway(e, V_list, S, alpha, L)
+                f = f + self._F_highway(z_list, e, V_list, S, alpha, L)
             return f
 
         grads_model = eqx.filter_grad(aug_energy)(model)
@@ -319,8 +444,11 @@ class ResErrorNetVariant:
                           rule="energy", v_reg=0.0):
         """ΔV_{L→i}. Sign convention: treat as 'gradient', i.e. V ← V - lr·ΔV.
 
-        energy: ΔV = +α e^i (e^L)ᵀ + ρ·V     (∂F_hw/∂V + ∂F_reg/∂V)
-        state : ΔV = -α z^i (e^L)ᵀ + ρ·V     (so subtracting yields Hebbian growth)
+        energy: ΔV = +α z^i (e^L)ᵀ + ρ·V     (∂F_hw_new/∂V + ∂F_reg/∂V)
+        state : ΔV = -α z^i (e^L)ᵀ + ρ·V     (Hebbian anti-gradient: subtracting yields growth)
+
+        Under the new highway energy F_hw = α·Σ z^i·(sg(e^L) @ V_iᵀ), the two
+        rules differ only in sign — same convention as the resnet18 variant.
 
         v_reg (ρ) adds an L2 penalty (ρ/2)·‖V‖² to the augmented free energy,
         bounding F below in V and preventing unbounded growth of the highway
@@ -337,8 +465,10 @@ class ResErrorNetVariant:
         delta_V = []
         for idx, i in enumerate(S):
             if rule == "energy":
-                dV = alpha * jnp.einsum("bi,bj->ij", e[i], e_L) / batch_size
+                # ∂F_hw_new/∂V_i = α · z^i (e^L)^T / B
+                dV = alpha * jnp.einsum("bi,bj->ij", z[i], e_L) / batch_size
             elif rule == "state":
+                # Hebbian anti-gradient: grows V along z^i (e^L)^T
                 dV = -alpha * jnp.einsum("bi,bj->ij", z[i], e_L) / batch_size
             else:
                 raise ValueError(f"Unknown v_update_rule: {rule!r}")
@@ -425,3 +555,13 @@ class ResErrorNetVariant:
 
     def get_V_arrays(self, bundle):
         return list(bundle["V_list"])
+
+    def get_weight_labels(self, bundle):
+        return [f"layer{i+1}" for i in range(len(self.get_weight_arrays(bundle)))]
+
+    def get_wandb_log_indices(self, bundle):
+        return list(range(len(self.get_weight_arrays(bundle))))
+
+    def get_activity_labels(self, bundle):
+        L = bundle["depth"] if "depth" in bundle else len(self.get_weight_arrays(bundle))
+        return [f"layer{i+1}" for i in range(L)]

@@ -1,7 +1,6 @@
 """Shared utilities for unified PC experiments."""
 
-import os
-os.environ['JAX_PLATFORMS'] = 'cpu'
+import common.jax_setup  # noqa: F401
 
 from common.data import (
     set_seed, MNIST, FashionMNIST, CIFAR10, one_hot,

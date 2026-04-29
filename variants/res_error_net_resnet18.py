@@ -128,6 +128,66 @@ def _jit_inference_scan(variant, bundle, z_init, x_batch, y_batch, alpha, dt, T)
 
 
 @eqx.filter_jit
+def _jit_inference_scan_adam(variant, bundle, z_init, x_batch, y_batch,
+                             alpha, lr, T, b1, b2, eps):
+    """T-step Adam-on-z scan. Per-coordinate adaptive step size on the
+    inference dynamics — much less sensitive to `lr` than plain Euler.
+    Shape-agnostic, so conv-shape z's (B, C, H, W) work identically."""
+    L = bundle["depth"]
+    z_free = [z_init[l] for l in range(L - 1)]
+    m0 = [jnp.zeros_like(zl) for zl in z_free]
+    v0 = [jnp.zeros_like(zl) for zl in z_free]
+    t0 = jnp.zeros((), dtype=jnp.int32)
+
+    def body(carry, _):
+        zf, m, v, t = carry
+        grads = jax.grad(
+            lambda zfree: variant.free_energy_z(
+                zfree, bundle, x_batch, y_batch, alpha
+            )
+        )(zf)
+        t_new = t + 1
+        m_new = [b1 * m[i] + (1.0 - b1) * grads[i] for i in range(len(zf))]
+        v_new = [b2 * v[i] + (1.0 - b2) * grads[i] ** 2 for i in range(len(zf))]
+        bc1 = 1.0 - b1 ** t_new
+        bc2 = 1.0 - b2 ** t_new
+        zf_new = [
+            zf[i] - lr * (m_new[i] / bc1) / (jnp.sqrt(v_new[i] / bc2) + eps)
+            for i in range(len(zf))
+        ]
+        return (zf_new, m_new, v_new, t_new), None
+
+    (zf_final, _, _, _), _ = jax.lax.scan(
+        body, (z_free, m0, v0, t0), None, length=T
+    )
+    return zf_final + [y_batch]
+
+
+@eqx.filter_jit
+def _jit_inference_step_adam(variant, bundle, z, m, v, t, x_batch, y_batch,
+                             alpha, lr, b1, b2, eps):
+    """One Adam-on-z step with externally maintained (m, v, t). Used by
+    the eager `record_energy=True` path and by diagnostic loops."""
+    L = bundle["depth"]
+    zf = [z[l] for l in range(L - 1)]
+    grads = jax.grad(
+        lambda zfree: variant.free_energy_z(
+            zfree, bundle, x_batch, y_batch, alpha
+        )
+    )(zf)
+    t_new = t + 1
+    m_new = [b1 * m[i] + (1.0 - b1) * grads[i] for i in range(len(zf))]
+    v_new = [b2 * v[i] + (1.0 - b2) * grads[i] ** 2 for i in range(len(zf))]
+    bc1 = 1.0 - b1 ** t_new
+    bc2 = 1.0 - b2 ** t_new
+    zf_new = [
+        zf[i] - lr * (m_new[i] / bc1) / (jnp.sqrt(v_new[i] / bc2) + eps)
+        for i in range(len(zf))
+    ]
+    return zf_new + [y_batch], m_new, v_new, t_new
+
+
+@eqx.filter_jit
 def _jit_forward_pass(variant, bundle, x_batch):
     return variant.forward_pass(bundle, x_batch)
 
@@ -180,6 +240,10 @@ class ResErrorNetResNet18Variant:
         dyt_init_alpha  = kwargs.get("dyt_init_alpha", 0.5)
         highway_include_stem = kwargs.get("highway_include_stem", True)
         v_init_scale    = kwargs.get("v_init_scale", 0.01)
+        inference_method = kwargs.get("inference_method", "euler")
+        inference_b1 = kwargs.get("inference_b1", 0.9)
+        inference_b2 = kwargs.get("inference_b2", 0.999)
+        inference_eps = kwargs.get("inference_eps", 1e-8)
 
         act_fn_callable = jpc.get_act_fn(act_fn)
         C_in, H, W = input_shape
@@ -270,6 +334,10 @@ class ResErrorNetResNet18Variant:
             "v_init_scale": v_init_scale,
             "blocks_per_stage": blocks_per_stage,
             "resnet_channels": list(channels),
+            "inference_method": inference_method,
+            "inference_b1": inference_b1,
+            "inference_b2": inference_b2,
+            "inference_eps": inference_eps,
         }
 
     # ------------------------------------------------------------------
@@ -369,24 +437,48 @@ class ResErrorNetResNet18Variant:
     def run_inference(self, bundle, x_batch, y_batch, alpha, dt, T,
                       z_init=None, record_energy=False):
         L = bundle["depth"]
+        method = bundle.get("inference_method", "euler")
+        b1 = bundle.get("inference_b1", 0.9)
+        b2 = bundle.get("inference_b2", 0.999)
+        eps = bundle.get("inference_eps", 1e-8)
         if z_init is None:
             z_init, _ = self.forward_pass(bundle, x_batch)
         z = list(z_init)
         z[L - 1] = y_batch
 
         if not record_energy:
-            z = _jit_inference_scan(
-                self, bundle, z, x_batch, y_batch, alpha, dt, T
-            )
+            if method == "adam":
+                z = _jit_inference_scan_adam(
+                    self, bundle, z, x_batch, y_batch, alpha, dt, T,
+                    b1, b2, eps,
+                )
+            else:
+                z = _jit_inference_scan(
+                    self, bundle, z, x_batch, y_batch, alpha, dt, T
+                )
             return z, None
 
         energies = []
-        for _ in range(T):
-            z = self.inference_step(bundle, z, x_batch, y_batch, alpha, dt)
-            z_free = [z[l] for l in range(L - 1)]
-            energies.append(float(
-                self.free_energy_z(z_free, bundle, x_batch, y_batch, alpha)
-            ))
+        if method == "adam":
+            m = [jnp.zeros_like(z[l]) for l in range(L - 1)]
+            v = [jnp.zeros_like(z[l]) for l in range(L - 1)]
+            t_count = jnp.zeros((), dtype=jnp.int32)
+            for _ in range(T):
+                z, m, v, t_count = _jit_inference_step_adam(
+                    self, bundle, z, m, v, t_count,
+                    x_batch, y_batch, alpha, dt, b1, b2, eps,
+                )
+                z_free = [z[l] for l in range(L - 1)]
+                energies.append(float(
+                    self.free_energy_z(z_free, bundle, x_batch, y_batch, alpha)
+                ))
+        else:
+            for _ in range(T):
+                z = self.inference_step(bundle, z, x_batch, y_batch, alpha, dt)
+                z_free = [z[l] for l in range(L - 1)]
+                energies.append(float(
+                    self.free_energy_z(z_free, bundle, x_batch, y_batch, alpha)
+                ))
         return z, energies
 
     # ------------------------------------------------------------------
@@ -569,7 +661,7 @@ class ResErrorNetResNet18Variant:
         for _, (img_batch, label_batch) in enumerate(test_loader):
             img_batch = img_batch.numpy()
             label_batch = label_batch.numpy()
-            z, _ = self.forward_pass(bundle, img_batch)
+            z, _ = _jit_forward_pass(self, bundle, img_batch)
             preds = z[-1]
             acc = float(jnp.mean(
                 jnp.argmax(preds, axis=1) == jnp.argmax(label_batch, axis=1)
@@ -583,3 +675,134 @@ class ResErrorNetResNet18Variant:
 
     def get_V_arrays(self, bundle):
         return list(bundle["V_list"])
+
+    def get_weight_labels(self, bundle):
+        """Human-readable name for each leaf returned by get_weight_arrays.
+
+        Mirrors the Equinox field order: Stem(conv, norm), BasicBlock(conv1,
+        conv2, skip_proj?, norm1, norm2), Head(linear). DyT contributes
+        three leaves per norm module in the order (alpha, gamma, beta).
+        """
+        layers = bundle["model"]
+        labels = []
+        block_idx = 0
+        for layer in layers:
+            if isinstance(layer, Stem):
+                labels.append("stem.conv")
+                if layer.norm is not None:
+                    labels += ["stem.norm.alpha", "stem.norm.gamma", "stem.norm.beta"]
+            elif isinstance(layer, BasicBlock):
+                p = f"block{block_idx}"
+                labels.append(f"{p}.conv1")
+                labels.append(f"{p}.conv2")
+                if layer.skip_proj is not None:
+                    labels.append(f"{p}.skip_proj")
+                if layer.norm1 is not None:
+                    labels += [f"{p}.norm1.alpha", f"{p}.norm1.gamma", f"{p}.norm1.beta"]
+                if layer.norm2 is not None:
+                    labels += [f"{p}.norm2.alpha", f"{p}.norm2.gamma", f"{p}.norm2.beta"]
+                block_idx += 1
+            elif isinstance(layer, Head):
+                labels.append("head.linear")
+            else:
+                labels.append(f"unknown_{type(layer).__name__}")
+        return labels
+
+    def get_wandb_log_indices(self, bundle):
+        """Subset of get_weight_arrays indices worth logging to wandb.
+
+        One conv per architectural block: stem conv, conv1 of each BasicBlock,
+        and the head linear. Keeps wandb uncluttered while still covering
+        every residual stage the image traverses.
+        """
+        labels = self.get_weight_labels(bundle)
+        return [
+            i for i, name in enumerate(labels)
+            if name == "stem.conv" or name.endswith(".conv1") or name == "head.linear"
+        ]
+
+    # ------------------------------------------------------------------
+    # Inference diagnostic
+    # ------------------------------------------------------------------
+
+    def diagnose_inference(self, bundle, x_batch, y_batch, alpha, dt, T,
+                           loss_type="mse"):
+        """Eager T-step inference with per-step (F, loss, acc) trajectory.
+
+        Returns dict with keys "energy", "loss", "acc", each a list of length
+        T+1: index 0 is the post-clamp pre-inference state (z = feed-forward,
+        z[L-1] := y), indices 1..T are after each inference step.
+
+        loss/acc are computed on μ^L = head(z^{L-2}) — the model's predicted
+        output given the current internal state — not on the clamped z[L-1]
+        (which would trivially match y). This is the meaningful signal for
+        whether inference is moving internal activities toward states that
+        produce a correct readout.
+        """
+        L = bundle["depth"]
+        method = bundle.get("inference_method", "euler")
+        b1 = bundle.get("inference_b1", 0.9)
+        b2 = bundle.get("inference_b2", 0.999)
+        eps = bundle.get("inference_eps", 1e-8)
+
+        z_init, _ = self.forward_pass(bundle, x_batch)
+        z = list(z_init)
+        z[L - 1] = y_batch
+
+        head = bundle["model"][L - 1]
+
+        def snap(z_state):
+            z_free = [z_state[l] for l in range(L - 1)]
+            F = float(self.free_energy_z(
+                z_free, bundle, x_batch, y_batch, alpha
+            ))
+            mu_L = vmap(head)(z_state[L - 2])
+            if loss_type == "ce":
+                loss = float(jpc.cross_entropy_loss(mu_L, y_batch))
+            else:
+                loss = float(jpc.mse_loss(mu_L, y_batch))
+            acc = float(jnp.mean(
+                jnp.argmax(mu_L, axis=1) == jnp.argmax(y_batch, axis=1)
+            ) * 100)
+            return F, loss, acc
+
+        energies, losses, accs = [], [], []
+        F, ll, ac = snap(z)
+        energies.append(F); losses.append(ll); accs.append(ac)
+
+        if method == "adam":
+            m = [jnp.zeros_like(z[l]) for l in range(L - 1)]
+            v = [jnp.zeros_like(z[l]) for l in range(L - 1)]
+            t_count = jnp.zeros((), dtype=jnp.int32)
+            for _ in range(T):
+                z, m, v, t_count = _jit_inference_step_adam(
+                    self, bundle, z, m, v, t_count,
+                    x_batch, y_batch, alpha, dt, b1, b2, eps,
+                )
+                F, ll, ac = snap(z)
+                energies.append(F); losses.append(ll); accs.append(ac)
+        else:
+            for _ in range(T):
+                z = self.inference_step(
+                    bundle, z, x_batch, y_batch, alpha, dt
+                )
+                F, ll, ac = snap(z)
+                energies.append(F); losses.append(ll); accs.append(ac)
+
+        return {"energy": energies, "loss": losses, "acc": accs}
+
+    def get_activity_labels(self, bundle):
+        """One label per PC activity (same length as z / layer_energies)."""
+        layers = bundle["model"]
+        out, bi = [], 0
+        for layer in layers:
+            if isinstance(layer, Stem):
+                out.append("stem")
+            elif isinstance(layer, BasicBlock):
+                out.append(f"block{bi}")
+                bi += 1
+            elif isinstance(layer, Head):
+                out.append("head")
+            else:
+                out.append(f"layer{len(out)}")
+        return out
