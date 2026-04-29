@@ -15,46 +15,60 @@ res-error-net does something structurally different:
 - It is a **true iterative PC network**: `z` states evolve under an ODE on the free energy `F`, standard PC W gradient descent at the fixed point, no Hebbian approximation on `W`.
 - The `V` matrices enter the **inference dynamics** (how `z` updates), not the target computation.
 - The `V` update rule drops out of an **augmented free energy** (derivation below) rather than by Hebbian analogy.
+- It can also optionally use **forward residual skips** in the MLP backbone, so you can combine a ResNet-like forward path with the output-error highways.
 
 ## Augmented Free Energy
 
 Standard PC free energy plus a bilinear coupling between each layer's local error and the output error:
 
 ```
-F({z^ℓ}, Θ, {V_{L→ℓ}}) = Σ_ℓ (1/2) ‖e^ℓ‖²      (standard PC)
-                         + Σ_{ℓ ∈ S} α (e^ℓ)ᵀ V_{L→ℓ} e^L    (error highway coupling)
+F({z^ℓ}, Θ, {V_{L→ℓ}}) = Σ_ℓ (1/2) mean ‖e^ℓ‖²                         (standard PC)
+                         + α · Σ_{ℓ ∈ S} mean( z^ℓ · ( sg(e^L) @ V_{L→ℓ}ᵀ ) )   (error highway coupling)
 ```
+
+The highway factor is the **state** `z^ℓ` (not the local error `e^ℓ`), and `e^L`
+is wrapped in `stop_gradient` so the highway term has no influence on `z^{L-1}`
+during inference (the last free layer aligns to the clamped target via `F_pc`
+only) and contributes 0 to `∂F/∂W`.
 
 where `e^ℓ = z^ℓ − μ^ℓ(z^{ℓ-1})`, `μ^ℓ` is the forward prediction from below, and `S ⊂ {1, …, L-1}` is the set of highway-endpoint layer indices. The output is hard-clamped: `z^L = y` during training, so `e^L = y − μ^L(z^{L-1})`.
 
+If `res_forward_skip_every = n > 0`, the hidden-layer prediction also gets a residual term every `n` layers:
+
+```
+μ^ℓ = f(W_ℓ z^{ℓ-1}) + z^{ℓ-n}
+```
+
+when `ℓ ≥ n` and the source and target widths match. This skip is applied to the predicted hidden state itself (post-activation), not to the highway energy term.
+
 ### Inference dynamics
 
-Gradient descent on `F` with respect to free `z^i` (for `i < L-1`, since `z^L` is clamped). Under the approximation `∂e^L/∂z^i = 0` for `i < L` (exact when output is free-variable clamped by a likelihood term), this simplifies to:
+Gradient descent on `F` with respect to free `z^i` (for `i < L-1`, since `z^L` is clamped). With `e^L` wrapped in `stop_gradient`, the highway term contributes only through its `z^i` factor, giving:
 
 ```
-ż^i = -e^i + J_iᵀ e^{i+1} - α · (V_{L→i} e^L   if i ∈ S else 0)
+ż^i = -e^i + J_iᵀ e^{i+1} - α · (V_{L→i} sg(e^L)   if i ∈ S else 0)
 ```
 
-where `J_i = ∂μ^{i+1}/∂z^i`. In practice we use `jax.grad` on the full augmented `F`, which picks up any additional cross-terms correctly for the hard-clamp case.
+where `J_i = ∂μ^{i+1}/∂z^i`. In practice we use `jax.grad` on the full augmented `F`; the `stop_gradient` blocks any flow through `e^L` so `z^{L-1}` is shaped only by `F_pc`.
 
 ### Learning rules
 
-- **W update** (unchanged from standard PC; `V` is assumed not to contribute):
+- **W update** (standard PC; `F_hw` contributes 0):
   ```
-  ΔW^ℓ = -∂F_pc/∂W^ℓ      → applied as W^ℓ ← W^ℓ - η_W · ΔW^ℓ
+  ΔW^ℓ = ∂F_pc/∂W^ℓ      → applied as W^ℓ ← W^ℓ - η_W · ΔW^ℓ
   ```
-  At the inference fixed point this recovers the usual PC rule `ΔW^ℓ ∝ e^ℓ · φ(z^{ℓ-1})ᵀ`. Computed via `jax.grad` on `F_pc` (no Hebbian shortcut).
+  Under the new energy `z` is constant w.r.t. model params and `stop_gradient` blocks flow through `e^L`, so `∂F_hw/∂W = 0` and the W update reduces to ∂F_pc/∂W. At the inference fixed point this recovers the usual PC rule `ΔW^ℓ ∝ e^ℓ · φ(z^{ℓ-1})ᵀ`. Computed via `jax.grad` on the augmented closure (which simplifies to F_pc for W).
 - **V update** (two options, selected by `--res-v-update-rule`):
-  - `energy` (default): dropped from `∂F/∂V`:
+  - `energy` (default): dropped from `∂F_hw/∂V`:
     ```
-    ΔV_{L→i} = α · e^i (e^L)ᵀ        (batch-averaged)
+    ΔV_{L→i} = +α · z^i (e^L)ᵀ        (batch-averaged)
     ```
-    Self-consistent stopping condition — `V` stops updating when local errors vanish. Jointly grounded with `W` in the same energy.
-  - `state` (original Hebbian sketch, kept for ablation):
+    Jointly grounded with `W` in the same energy.
+  - `state` (Hebbian anti-gradient, kept for ablation):
     ```
-    ΔV_{L→i} = -α · z^i (e^L)ᵀ       (stored negated so optax subtraction yields +α·z^i·(e^L)ᵀ)
+    ΔV_{L→i} = -α · z^i (e^L)ᵀ        (stored negated so optax subtraction yields +α·z^i·(e^L)ᵀ growth)
     ```
-    Not energy-derived; keeps driving `V` even at the PC fixed point.
+    Same direction as `energy` but opposite sign convention.
 
 ## Visual Intuition
 
@@ -96,7 +110,7 @@ e^ℓ = z^ℓ − μ^ℓ(z^{ℓ-1})       for ℓ = 0 .. L-1   (with z^{L-1} = y
 ΔW^ℓ = ∂F_pc/∂W^ℓ
 
 # Step 6. Compute ΔV per configured rule
-ΔV_{L→i} = α · e^i (e^L)ᵀ / B         (energy)
+ΔV_{L→i} = +α · z^i (e^L)ᵀ / B         (energy)
        or  −α · z^i (e^L)ᵀ / B         (state)
 
 # Step 7. Re-project both to Gaussian ball of radius c (paper trick from rec-LRA)
@@ -112,6 +126,7 @@ e^ℓ = z^ℓ − μ^ℓ(z^{ℓ-1})       for ℓ = 0 .. L-1   (with z^{L-1} = y
 | `depth` | `--depths` | — | Number of layers `L` (counting input-side Linear as layer 0 and output as layer L-1). |
 | `width` | (in config) | 128 | Hidden layer width (uniform). |
 | `act_fn` | `--act-fns` | relu | Activation: `tanh`, `relu`, `selu`, etc. |
+| `res_forward_skip_every` | `--res-forward-skip-every` | 0 | Forward residual skip interval for the MLP backbone. `0` disables skips; `n>0` adds `z^{ℓ-n}` into the prediction of layer `ℓ` when widths match. |
 | `res_highway_every_k` | `--res-highway-every-k` | 2 | Stride of the V highways. `S = {L−1−k, L−1−2k, …} ∩ [1, L−2]`. Larger k = sparser highways. |
 | `res_v_init_scale` | `--res-v-init-scale` | 0.01 | Init scale for `V_{L→i}` (N(0, σ²)). Small so the highway starts near off. |
 | `res_init_scheme` | `--res-init-scheme` | `jpc_default` | `jpc_default` = 1/√fan_in (stable without ZCA); `unit_gaussian` = rec-LRA paper style (needs ZCA / small dt to avoid activation blow-up). |
@@ -143,6 +158,7 @@ e^ℓ = z^ℓ − μ^ℓ(z^{ℓ-1})       for ℓ = 0 .. L-1   (with z^{L-1} = y
 - **`α`** controls how strongly `e^L` drives inference at highway endpoints. Too small → highway does nothing and you recover plain iterative PC. Too large → `z^i` is yanked toward an output-conditioned fixed point and local prediction errors can't settle.
 - **`res_inference_dt` × `res_inference_T`** sets the effective "integration time" of the ODE. If dt is too large the Euler scheme diverges; if T is too small z doesn't converge. Total integration `dt·T` ≈ 1–5 is usually enough.
 - **`res_v_lr`** should be comparable to or smaller than `param_lr` at first — V matrices live in a different regime from W and can destabilise training if they grow too fast. The reproject-to-ball trick helps bound per-step growth.
+- **`res_forward_skip_every`** changes the forward prediction family itself. Smaller values create denser residual shortcuts; `0` keeps the original plain-MLP backbone.
 - **`res_highway_every_k`**: lower `k` = denser highways (more V matrices), more parameters, stronger credit-assignment signal; higher `k` = sparser, cleaner to analyse.
 
 ## Quick Start
@@ -154,9 +170,19 @@ conda activate jax_env
 python run_training.py --variant res_error_net --depths 6 --n-iters 1000 \
     --act-fns relu --no-wandb
 
+# CIFAR-10 (flat MLP on 3072-dim flattened pixels). input_dim is derived
+# from --dataset; --use-zca enables GCN+ZCA preprocessing.
+python run_training.py --variant res_error_net --dataset CIFAR10 \
+    --depths 6 --n-iters 2000 --act-fns relu --use-zca --no-wandb
+
 # Deeper network — the regime where the highway should matter most
 python run_training.py --variant res_error_net --depths 12 --n-iters 3000 \
     --act-fns relu --res-alpha 0.1 --res-highway-every-k 2 --no-wandb
+
+# Add forward residual skips every 2 layers as well
+python run_training.py --variant res_error_net --depths 12 --n-iters 3000 \
+    --act-fns relu --res-forward-skip-every 2 \
+    --res-alpha 0.1 --res-highway-every-k 2 --no-wandb
 
 # α = 0 (disables highway — reduces to plain iterative PC, useful as a baseline)
 python run_training.py --variant res_error_net --depths 12 --n-iters 3000 \
@@ -302,7 +328,7 @@ docs/res_error_net.md                # This file
 - **Output clamp**: `hard` is the only supported mode right now. Soft-clamp (z^L evolves under `-e^L`) is more faithful to the continuous derivation but risks positive-feedback loops through `V e^L`. The config field is reserved but not wired.
 - **`α` is a global scalar**: per-layer `α_i` or learnable `α_i` (trained via the energy gradient) would be principled extensions. Not implemented — sweep `α` globally first.
 - **Multi-source highways**: currently only `V_{L→i}`. Adding `V_{j→i}` for intermediate sources `j < L` is an obvious generalisation (O(L²) matrices); deferred.
-- **CNN variant**: `cnn_res_error_net.py` is not yet written. Follow the `cnn_rec_lra.py` pattern for CIFAR-10 experiments once the MLP version is validated.
+- **CNN variant**: the MLP variant already runs on CIFAR-10 as a flat MLP over flattened pixels (input_dim=3072), which is enough for ablation studies of the highway mechanism itself. A convolutional `cnn_res_error_net.py` (analogous to `cnn_rec_lra.py`) is still TODO if spatial structure matters for the experiment. The ResNet-18 backbone variant (`res_error_net_resnet18`) is the convolutional counterpart already in tree.
 - **Inference loop is a Python `for`, not `jax.lax.scan`**: fine for correctness, slower than it could be. If running becomes a bottleneck, wrap `inference_step` in `scan` with `(z, e)` as carry.
 - **Sign convention sanity check**: with `e^ℓ = z^ℓ − μ^ℓ`, standard PC `ΔW^ℓ ∝ e^ℓ · φ(z^{ℓ-1})ᵀ` points downhill. `compute_W_updates` uses `jax.grad` on `F_pc`, yielding `+∂F/∂W`; applied as `W ← W − lr · ΔW` via optax. A flipped sign would silently make learning go uphill — verify by confirming train loss decreases in the first few iterations.
 - **`α = 0` regression**: running with `--res-alpha 0.0` removes the highway contribution entirely and must match a plain iterative PC baseline. Verified in smoke tests; keep as a sanity check when changing inference code.

@@ -19,6 +19,7 @@ import jax.random as jr
 from config import (
     ExperimentConfig, ALL_VARIANTS,
     VARIANT_REC_LRA, VARIANT_CNN_REC_LRA, VARIANT_RES_ERROR_NET,
+    VARIANT_RES_ERROR_NET_RESNET18,
 )
 from variants import get_variant
 from training.trainer import train_and_record
@@ -68,6 +69,16 @@ def run_single(cfg):
                     v_init_scale=cfg.res_v_init_scale,
                     res_init_scheme=cfg.res_init_scheme,
                 )
+            if cfg.variant == VARIANT_RES_ERROR_NET_RESNET18:
+                extra_create_kwargs = dict(
+                    input_shape=(3, 32, 32),
+                    resnet_channels=cfg.res_resnet_channels,
+                    blocks_per_stage=cfg.res_resnet_blocks_per_stage,
+                    normalization=cfg.res_resnet_normalization,
+                    dyt_init_alpha=cfg.res_resnet_dyt_init_alpha,
+                    highway_include_stem=cfg.res_resnet_highway_include_stem,
+                    v_init_scale=cfg.res_v_init_scale,
+                )
 
             model = variant.create_model(
                 key, depth=depth, width=cfg.width, act_fn=act_fn,
@@ -79,10 +90,17 @@ def run_single(cfg):
                 **extra_create_kwargs,
             )
 
-            if cfg.variant == VARIANT_RES_ERROR_NET:
+            if cfg.variant in (VARIANT_RES_ERROR_NET, VARIANT_RES_ERROR_NET_RESNET18):
+                # CNN variant uses its own T default (each inference step is
+                # ~100× costlier than the MLP variant).
+                eff_T = (
+                    cfg.res_resnet_inference_T
+                    if cfg.variant == VARIANT_RES_ERROR_NET_RESNET18
+                    else cfg.res_inference_T
+                )
                 res = train_res_error_net(
                     variant=variant,
-                    model=model,
+                    bundle=model,
                     depth=depth,
                     seed=cfg.seed,
                     param_lr=cfg.param_lr,
@@ -93,7 +111,7 @@ def run_single(cfg):
                     act_fn=act_fn,
                     dataset=cfg.dataset,
                     alpha=cfg.res_alpha,
-                    inference_T=cfg.res_inference_T,
+                    inference_T=eff_T,
                     inference_dt=cfg.res_inference_dt,
                     v_update_rule=cfg.res_v_update_rule,
                     optim_type=cfg.res_optim,
@@ -362,6 +380,33 @@ def main():
         help="L2 penalty ρ on V highway matrices (res-error-net, default: 0.0). "
              "Adds ρ·V to ΔV so F_aug is bounded below in V.",
     )
+    # res-error-net-resnet18 arguments
+    parser.add_argument(
+        "--res-resnet-channels", type=int, nargs="+", default=None,
+        help="Channels per stage for ResNet-18: [stem, s1, s2, s3, s4] "
+             "(default: [64, 64, 128, 256, 512])",
+    )
+    parser.add_argument(
+        "--res-resnet-blocks-per-stage", type=int, default=None,
+        help="Basic blocks per stage (default: 2 → ResNet-18)",
+    )
+    parser.add_argument(
+        "--res-resnet-normalization", choices=["dyt", "none"], default=None,
+        help="Per-block normalization: 'dyt' (DyT) or 'none' (default: dyt)",
+    )
+    parser.add_argument(
+        "--res-resnet-dyt-init-alpha", type=float, default=None,
+        help="Initial α for DyT layers (default: 0.5, matches variants/dyt.py)",
+    )
+    parser.add_argument(
+        "--res-resnet-no-stem-highway", action="store_true",
+        help="Exclude the stem output from the set of highway activities",
+    )
+    parser.add_argument(
+        "--res-resnet-inference-T", type=int, default=None,
+        help="Inference steps for ResNet-18 variant (default: 15; the MLP "
+             "variant uses 50 but each CNN step is ~100× more expensive)",
+    )
     # CNN-rec-LRA arguments
     parser.add_argument(
         "--cnn-channels", type=int, nargs="+", default=None,
@@ -488,6 +533,18 @@ def main():
             overrides["res_init_scheme"] = args.res_init_scheme
         if args.res_v_reg is not None:
             overrides["res_v_reg"] = args.res_v_reg
+        if args.res_resnet_channels:
+            overrides["res_resnet_channels"] = args.res_resnet_channels
+        if args.res_resnet_blocks_per_stage is not None:
+            overrides["res_resnet_blocks_per_stage"] = args.res_resnet_blocks_per_stage
+        if args.res_resnet_normalization is not None:
+            overrides["res_resnet_normalization"] = args.res_resnet_normalization
+        if args.res_resnet_dyt_init_alpha is not None:
+            overrides["res_resnet_dyt_init_alpha"] = args.res_resnet_dyt_init_alpha
+        if args.res_resnet_no_stem_highway:
+            overrides["res_resnet_highway_include_stem"] = False
+        if args.res_resnet_inference_T is not None:
+            overrides["res_resnet_inference_T"] = args.res_resnet_inference_T
         if args.cnn_channels:
             overrides["cnn_channels"] = args.cnn_channels
         if args.cnn_fc_width:

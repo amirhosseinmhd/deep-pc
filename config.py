@@ -55,12 +55,14 @@ VARIANT_MUPC = "mupc"
 VARIANT_REC_LRA = "rec_lra"
 VARIANT_CNN_REC_LRA = "cnn_rec_lra"
 VARIANT_RES_ERROR_NET = "res_error_net"
+VARIANT_RES_ERROR_NET_RESNET18 = "res_error_net_resnet18"
 
 ALL_VARIANTS = [
     VARIANT_BASELINE, VARIANT_RESNET, VARIANT_BF,
     VARIANT_BF_V2, VARIANT_DYT, VARIANT_DYT_V2,
     VARIANT_DYT_V3, VARIANT_MUPC, VARIANT_REC_LRA,
     VARIANT_CNN_REC_LRA, VARIANT_RES_ERROR_NET,
+    VARIANT_RES_ERROR_NET_RESNET18,
 ]
 
 
@@ -120,7 +122,8 @@ class ExperimentConfig:
     # training. Pass --alpha-e-skip 0.19 --alpha-e-adj 0.24 to opt back in.
     alpha_e_skip: float = 1.0
     alpha_e_adj: float = 1.0
-    reproject_c: float = 1.0          # Gaussian-ball update radius
+    reproject_c: float = 1.0          # Per-leaf Gaussian-ball update radius (0 disables)
+    global_clip_norm: float = 10.0    # Global-norm clipping threshold for delta_W (res-error-net only; 0 disables)
     input_noise_sigma: float = 0.1
     weight_decay: float = 1e-4
     use_layer_norm: bool = True
@@ -137,19 +140,79 @@ class ExperimentConfig:
 
     # res-error-net specific
     res_highway_every_k: int = 3
+    # Optional forward residual skip interval for the MLP res-error-net.
+    # 0 disables skips; n>0 adds z^{l-n} into the prediction of layer l when
+    # dimensions match.
+    res_forward_skip_every: int = 0
     res_alpha: float = 1
-    res_inference_T: int = 50
+    res_inference_T: int = 100
     res_inference_dt: float = 0.1
+    # "euler" → plain gradient flow ż = -∂F/∂z (sensitive to dt).
+    # "adam"  → per-coordinate adaptive Adam-on-z; dt is treated as a
+    # learning rate, much more robust to its value.
+    res_inference_method: str = "euler"
     res_v_lr: float = 1e-4
     res_v_update_rule: str = "energy"   # "energy" or "state"
-    res_v_init_scale: float = 1
+    res_v_init_scale: float = 0.01
     res_output_clamp: str = "hard"       # soft reserved for future
     res_optim: str = "adamw"
     res_loss: str = "mse"
     res_init_scheme: str = "jpc_default"  # "jpc_default" or "unit_gaussian"
     # L2 penalty ρ on V_{L→i}. Adds (ρ/2)·Σ‖V‖² to F_aug so ΔV gains a +ρ·V
     # term, keeping V bounded and F bounded below in V.
-    res_v_reg: float = 0.0
+    res_v_reg: float = 0.1
+
+    # res-error-net-resnet18 specific (CIFAR-10 ResNet-18 backbone)
+    # Strength of the highway term in the augmented free energy. Larger values
+    # make the output-error shortcuts influence hidden-state inference more.
+    res_resnet_alpha: float = 1
+    # `res_resnet_channels` = [stem_C, stage1_C, stage2_C, stage3_C, stage4_C];
+    # blocks_per_stage=2 → 8 basic blocks (ResNet-18 layout).
+    # Example: [64, 64, 128, 256, 512] = 64-channel stem, then 4 stages.
+    res_resnet_channels: List[int] = field(default_factory=lambda: [64, 64, 128, 256, 512])
+    # Number of residual BasicBlocks in each stage. With 4 stages and value 2,
+    # this gives the usual CIFAR-style ResNet-18 backbone.
+    res_resnet_blocks_per_stage: int = 2
+    # "dyt" → DyT(x)=γ·tanh(α·x)+β per channel (stateless, per-example);
+    # "none" → identity. No BatchNorm: running stats go stale during T-step
+    # iterative inference.
+    res_resnet_normalization: str = "dyt"
+    # Initial scalar α inside each DyT layer. Higher values make DyT saturate
+    # faster; lower values keep it closer to linear near the origin.
+    res_resnet_dyt_init_alpha: float = 0.5
+    # Whether z_s (stem output) gets a V_{L→s} highway in addition to the 8
+    # block-output highways.
+    res_resnet_highway_include_stem: bool = True
+    # Euler step size for predictive-coding inference on hidden states z.
+    # Larger values move states faster each step but can destabilize dynamics.
+    res_resnet_inference_dt: float = 0.1
+    # CNN-specific T override. Each inference step on a ResNet-18 is ~100×
+    # more expensive than on the MLP variant, so the MLP default (50) is
+    # wasteful here. This is the number of inference steps per training batch.
+    res_resnet_inference_T: int = 30
+    # "euler" → plain gradient flow ż = -∂F/∂z (sensitive to dt).
+    # "adam"  → per-coordinate adaptive Adam-on-z; dt is treated as a learning
+    # rate, much more robust to its value. Same hand-rolled Adam as the MLP
+    # variant, applied per-coordinate to (B, C, H, W) z tensors.
+    res_resnet_inference_method: str = "euler"
+    # Learning rate for the highway matrices V_{L→i}.
+    res_resnet_v_lr: float = 1e-4
+    # How V is updated:
+    # "energy" = gradient-style update from the highway energy term,
+    # "state"  = alternative Hebbian/state-based rule.
+    res_resnet_v_update_rule: str = "energy"   # "energy" or "state"
+    # Standard deviation multiplier for initializing the highway matrices V.
+    # Smaller values weaken the shortcut signal at initialization.
+    res_resnet_v_init_scale: float = 0.01
+    # Optimizer used for both model weights and V matrices in this variant.
+    res_resnet_optim: str = "adamw"
+    # Loss used only for reporting/evaluation during training:
+    # "mse" compares logits to one-hot targets, "ce" uses cross-entropy.
+    res_resnet_loss: str = "mse"
+    # ResNet-specific L2 penalty on V_{L→i}. Kept separate from `res_v_reg`
+    # so the CNN variant can be stabilized without affecting the MLP one.
+    # Larger values shrink V more aggressively and keep highway norms bounded.
+    res_resnet_v_reg: float = 0.1
 
     # Condition number experiment
     cond_width: int = COND_WIDTH
