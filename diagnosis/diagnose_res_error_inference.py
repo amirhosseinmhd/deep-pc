@@ -30,6 +30,10 @@ Run:
 """
 
 import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import common.jax_setup  # noqa: F401  -- must come before any jax import
 
 import numpy as np
 import jax
@@ -38,8 +42,6 @@ import jax.random as jr
 import equinox as eqx
 import optax
 import matplotlib.pyplot as plt
-
-import common.jax_setup  # noqa: F401  -- pick up CUDA if available
 
 from config import (
     ExperimentConfig,
@@ -63,13 +65,13 @@ from common.data import get_dataloaders, set_seed
 
 # "mlp"      → res-error-net (MLP backbone, MNIST/FashionMNIST).
 # "resnet18" → res-error-net-resnet18 (ResNet-18 backbone, CIFAR-10).
-VARIANT             = "mlp"
+VARIANT             = "resnet18"
 
-ACT_FN              = "tanh"     # used by both; "relu" is typical for the CNN
+ACT_FN              = "relu"     # used by both; "relu" is typical for the CNN
 ALPHA               = 0.1
 INFERENCE_METHOD    = "adam"     # "euler" or "adam"
-INFERENCE_DT        = 0.05       # for "adam", interpreted as the Adam learning rate
-INFERENCE_T_TRAIN   = 100        # T used during the training phase
+INFERENCE_DT        = 0.1       # for "adam", interpreted as the Adam learning rate
+INFERENCE_T_TRAIN   = 500        # T used during the training phase
 ADAM_B1             = 0.9
 ADAM_B2             = 0.999
 ADAM_EPS            = 1e-8

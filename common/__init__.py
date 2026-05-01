@@ -1,6 +1,6 @@
 """Shared utilities for unified PC experiments."""
 
-import common.jax_setup  # noqa: F401
+from common import jax_setup  # noqa: F401
 
 from common.data import (
     set_seed, MNIST, FashionMNIST, CIFAR10, one_hot,
