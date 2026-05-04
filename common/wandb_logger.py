@@ -34,6 +34,10 @@ def init_wandb(cfg, depth, act_fn):
 
     # Custom x-axis for test metrics
     wandb.define_metric("test_acc", step_metric="test_iter")
+    # Inference-diagnostic scalars are logged at checkpoint cadence; group
+    # them under inference_iter so they plot against training iter, not the
+    # global wandb step (which jumps by `test_every` between checkpoints).
+    wandb.define_metric("inference/*", step_metric="inference_iter")
 
 
 def log_step_metrics(iter_num, metrics_dict):
