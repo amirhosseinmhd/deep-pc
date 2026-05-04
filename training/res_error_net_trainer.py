@@ -11,12 +11,26 @@ Per batch:
   7. Apply via optax (AdamW/Adam) or SGD
 """
 
+import math
+
 import numpy as np
 import jax.numpy as jnp
 import jax.random as jr
 import jpc
 import optax
 import equinox as eqx
+
+
+def _schedule_alpha(alpha0, alpha_min, t, T, mode):
+    """Per-iter highway coupling. alpha0=initial, alpha_min=endpoint, t∈[0,T)."""
+    if mode == "fixed" or T <= 1:
+        return alpha0
+    frac = t / (T - 1)
+    if mode == "linear":
+        return alpha0 + (alpha_min - alpha0) * frac
+    if mode == "cosine":
+        return alpha_min + 0.5 * (alpha0 - alpha_min) * (1.0 + math.cos(math.pi * frac))
+    raise ValueError(f"Unknown alpha_schedule: {mode!r}")
 
 from common.data import set_seed, get_dataloaders
 from common.metrics import MetricsCollector
@@ -99,8 +113,8 @@ def train_res_error_net(
     v_update_rule="energy",
     optim_type="adamw",
     loss_type="mse",
-    reproject_c=1.0,
-    global_clip_norm=10.0,
+    reproject_c=0.0,
+    global_clip_norm=0.0,
     input_noise_sigma=0.1,
     weight_decay=1e-4,
     v_reg=0.0,
@@ -110,6 +124,9 @@ def train_res_error_net(
     track_grad_norms=True,
     track_layer_energy=True,
     use_wandb=False,
+    alpha_schedule="fixed",
+    alpha_min=0.0,
+    freeze_v=False,
 ):
     """Train a res-error-net and record all metrics."""
     set_seed(seed)
@@ -166,6 +183,14 @@ def train_res_error_net(
     # layer over training (not overwriting). One line per checkpoint iter.
     inference_history = []
 
+    # Held-out batch for the inference diagnostic. Using the just-trained
+    # batch made the pre→post gap collapse after a few iters (the model has
+    # already memorized that batch via the gradient step we just applied).
+    # A fixed test batch keeps the pre/post comparison meaningful across
+    # checkpoints. None until first checkpoint to avoid loading test data
+    # for runs that don't log to wandb.
+    diag_batch = None
+
     data_iter = iter(train_loader)
     for iter_num in range(n_train_iters):
         try:
@@ -176,6 +201,10 @@ def train_res_error_net(
 
         img_batch = img_batch.numpy()
         label_batch = label_batch.numpy()
+
+        alpha_t = _schedule_alpha(
+            alpha, alpha_min, iter_num, n_train_iters, alpha_schedule
+        )
 
         if input_noise_sigma and input_noise_sigma > 0.0:
             noise_key, sub = jr.split(noise_key)
@@ -196,7 +225,7 @@ def train_res_error_net(
         # --- Step 2-3: Clamp output + T inference steps (JIT scan) ---
         z, _ = variant.run_inference(
             bundle, img_batch, label_batch,
-            alpha=alpha, dt=inference_dt, T=inference_T,
+            alpha=alpha_t, dt=inference_dt, T=inference_T,
             z_init=z_init, record_energy=False,
         )
 
@@ -204,10 +233,12 @@ def train_res_error_net(
             # Single JIT: e + ΔW + ΔV + per-layer energies from one forward+backward.
             e, delta_W, delta_V, energies_jax = _jit_compute_updates_fused(
                 variant, bundle, z, img_batch, label_batch,
-                alpha, v_update_rule, v_reg,
+                alpha_t, v_update_rule, v_reg,
             )
             if track_layer_energy:
                 metrics.energy_per_layer.append(energies_jax.tolist())
+            if freeze_v:
+                delta_V = [jnp.zeros_like(V) for V in bundle["V_list"]]
         else:
             # --- Errors at convergence (for logging & updates) ---
             e = _jit_compute_errors(variant, bundle, z, img_batch, label_batch)
@@ -220,14 +251,17 @@ def train_res_error_net(
 
             # --- Step 4: ΔW from F_pc autodiff ---
             delta_W = _jit_compute_W_updates(
-                variant, bundle, z, img_batch, label_batch, alpha
+                variant, bundle, z, img_batch, label_batch, alpha_t
             )
 
             # --- Step 5: ΔV per configured rule (+ optional L2 on V) ---
-            delta_V = _jit_compute_V_updates(
-                variant, bundle, z, img_batch, label_batch, alpha,
-                v_update_rule, v_reg,
-            )
+            if freeze_v:
+                delta_V = [jnp.zeros_like(V) for V in bundle["V_list"]]
+            else:
+                delta_V = _jit_compute_V_updates(
+                    variant, bundle, z, img_batch, label_batch, alpha_t,
+                    v_update_rule, v_reg,
+                )
 
         # --- Step 6: Re-project (per-leaf) — optional, default on for rec-LRA
         # parity. For res-error-net experiments prefer --reproject-c 0 and
@@ -263,13 +297,18 @@ def train_res_error_net(
 
         # --- Step 7: Apply ---
         if use_optax:
-            bundle, w_opt_state, v_opt_state = variant.apply_optax_updates(
-                bundle, delta_W, delta_V,
-                w_optim, w_opt_state, v_optim, v_opt_state,
-            )
+            if freeze_v:
+                bundle, w_opt_state = variant.apply_optax_updates_w_only(
+                    bundle, delta_W, w_optim, w_opt_state,
+                )
+            else:
+                bundle, w_opt_state, v_opt_state = variant.apply_optax_updates(
+                    bundle, delta_W, delta_V,
+                    w_optim, w_opt_state, v_optim, v_opt_state,
+                )
         else:
             bundle = variant.apply_sgd_updates(
-                bundle, delta_W, delta_V, param_lr, v_lr
+                bundle, delta_W, delta_V, param_lr, (0.0 if freeze_v else v_lr)
             )
 
         if track_activity_norms:
@@ -296,6 +335,7 @@ def train_res_error_net(
             wb_metrics = {
                 "train_loss": train_loss,
                 "train_acc": train_acc,
+                "alpha_t": float(alpha_t),
                 "grad_global_norm/pre_clip": float(grad_global_norm_pre),
                 "grad_global_norm/post_clip": float(grad_global_norm_post),
             }
@@ -344,16 +384,22 @@ def train_res_error_net(
                     "test_iter": iter_num + 1,
                 })
 
-            # --- Inference diagnostic: F, loss, acc trajectory across T steps.
-            # loss/acc are on μ^L = head(z^{L-2}) — the model's prediction from
-            # the current internal state — since z[L-1] is clamped to y during
-            # inference and would yield a trivial 0 loss / 100% acc.
+            # --- Inference diagnostic: F, loss, acc trajectory across T steps
+            # on a held-out test batch. loss/acc are on μ^L = head(z^{L-2})
+            # — the model's prediction from the current internal state —
+            # since z[L-1] is clamped to y during inference and would yield
+            # a trivial 0 loss / 100% acc.
             if use_wandb and hasattr(variant, "diagnose_inference"):
                 import wandb
 
+                if diag_batch is None:
+                    diag_img, diag_lab = next(iter(test_loader))
+                    diag_batch = (diag_img.numpy(), diag_lab.numpy())
+                d_img, d_lab = diag_batch
+
                 diag = variant.diagnose_inference(
-                    bundle, img_batch, label_batch,
-                    alpha=alpha, dt=inference_dt, T=inference_T,
+                    bundle, d_img, d_lab,
+                    alpha=alpha_t, dt=inference_dt, T=inference_T,
                     loss_type=loss_type,
                 )
                 inference_history.append({
@@ -363,20 +409,9 @@ def train_res_error_net(
                     "acc":  list(diag["acc"]),
                 })
 
-                # Pre/post overlay: two series ("pre", "post") at the same
-                # training-iter x. The vertical gap at each x visualizes the
-                # drop (F, loss) or gain (acc) per checkpoint.
-                iters_x = [h["iter"] for h in inference_history]
-                F_pre  = [h["F"][0]    for h in inference_history]
-                F_post = [h["F"][-1]   for h in inference_history]
-                L_pre  = [h["loss"][0] for h in inference_history]
-                L_post = [h["loss"][-1] for h in inference_history]
-                A_pre  = [h["acc"][0]  for h in inference_history]
-                A_post = [h["acc"][-1] for h in inference_history]
-
                 # Heatmap trajectories: rows = checkpoints, cols = inference
                 # step, color = metric. One image per metric, re-rendered each
-                # checkpoint. Stays readable however many checkpoints accumulate.
+                # checkpoint.
                 import matplotlib.pyplot as plt
 
                 fig_F = _trajectory_heatmap(
@@ -395,22 +430,25 @@ def train_res_error_net(
                     "accuracy (%)",
                 )
 
-                log_step_metrics(iter_num, {
-                    "inference/F_pre_post": wandb.plot.line_series(
-                        xs=iters_x, ys=[F_pre, F_post], keys=["pre", "post"],
-                        title="Free energy: pre vs post inference",
-                        xname="training iter",
-                    ),
-                    "inference/loss_pre_post": wandb.plot.line_series(
-                        xs=iters_x, ys=[L_pre, L_post], keys=["pre", "post"],
-                        title="μ^L loss: pre vs post inference",
-                        xname="training iter",
-                    ),
-                    "inference/acc_pre_post": wandb.plot.line_series(
-                        xs=iters_x, ys=[A_pre, A_post], keys=["pre", "post"],
-                        title="μ^L accuracy: pre vs post inference",
-                        xname="training iter",
-                    ),
+                # Plain scalars for pre / post / drop. These appear in the
+                # standard wandb metric panel (custom-chart line_series did
+                # not, which is why pre/post values were invisible). The
+                # "inference/*" metrics use `inference_iter` as their x-axis
+                # via define_metric in init_wandb.
+                F_pre,  F_post  = diag["energy"][0], diag["energy"][-1]
+                L_pre,  L_post  = diag["loss"][0],   diag["loss"][-1]
+                A_pre,  A_post  = diag["acc"][0],    diag["acc"][-1]
+                wandb.log({
+                    "inference_iter":     iter_num + 1,
+                    "inference/F_pre":    F_pre,
+                    "inference/F_post":   F_post,
+                    "inference/F_drop":   F_pre - F_post,
+                    "inference/loss_pre":  L_pre,
+                    "inference/loss_post": L_post,
+                    "inference/loss_drop": L_pre - L_post,
+                    "inference/acc_pre":   A_pre,
+                    "inference/acc_post":  A_post,
+                    "inference/acc_gain":  A_post - A_pre,
                     "inference/F_heatmap":    wandb.Image(fig_F),
                     "inference/loss_heatmap": wandb.Image(fig_L),
                     "inference/acc_heatmap":  wandb.Image(fig_A),

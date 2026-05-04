@@ -150,11 +150,16 @@ class ResErrorNetVariant:
         input_dim = kwargs.get("input_dim", _DEFAULT_INPUT_DIM)
         output_dim = kwargs.get("output_dim", _DEFAULT_OUTPUT_DIM)
         highway_every_k = kwargs.get("highway_every_k", 2)
+        s_mode = kwargs.get("s_mode", "stride")
         forward_skip_every = kwargs.get("forward_skip_every", 0)
         v_init_scale = kwargs.get("v_init_scale", 0.01)
         # "unit_gaussian" mirrors rec-LRA paper (p.16); "jpc_default" keeps
         # the 1/√fan_in scale which is stable without ZCA preprocessing.
         init_scheme = kwargs.get("res_init_scheme", "jpc_default")
+        # "sp" or "mupc" (Innocenti et al. 2025). When "mupc", the forward
+        # pass applies per-layer scalings (1/√D, 1/√N, …, 1/N) and weights
+        # are re-initialised as N(0, 1) — overriding init_scheme.
+        param_type = kwargs.get("res_param_type", "sp")
         # "euler" (plain gradient flow) or "adam" (per-coordinate adaptive
         # step size on z). Adam treats `dt` as a learning rate and is far
         # less sensitive to its value.
@@ -171,7 +176,12 @@ class ResErrorNetVariant:
         )
         act_fn_callable = jpc.get_act_fn(act_fn)
 
-        if init_scheme == "unit_gaussian":
+        if param_type == "mupc":
+            # μPC: weights N(0, 1) on every layer (incl. output); scalings
+            # in the forward pass do the variance work.
+            model = self._reinit_unit_gaussian(model, key, include_output=True)
+            key, _ = jr.split(key)
+        elif init_scheme == "unit_gaussian":
             model = self._reinit_unit_gaussian(model, key)
             key, _ = jr.split(key)
         elif init_scheme == "kaiming":
@@ -180,15 +190,33 @@ class ResErrorNetVariant:
 
         dims = [output_dim if (i + 1) == depth else width for i in range(depth)]
         output_idx = depth - 1
+        candidates = list(range(1, output_idx))   # layers 1 .. depth-2
 
-        # S = {output_idx - k, output_idx - 2k, …} ∩ [1, output_idx - 1]
-        S = []
-        for step in range(1, depth):
-            i = output_idx - highway_every_k * step
-            if 1 <= i <= output_idx - 1:
-                S.append(i)
+        if s_mode == "stride":
+            # S = {output_idx - k, output_idx - 2k, …} ∩ [1, output_idx - 1]
+            S = []
+            for step in range(1, depth):
+                i = output_idx - highway_every_k * step
+                if 1 <= i <= output_idx - 1:
+                    S.append(i)
+                else:
+                    break
+        elif s_mode == "dense":
+            S = list(candidates)
+        elif s_mode == "sparse":
+            S = candidates[-1:] if candidates else []
+        elif s_mode == "random":
+            # |S| matched to the stride default for fair comparison
+            target_size = max(1, len(candidates) // highway_every_k)
+            target_size = min(target_size, len(candidates))
+            if candidates:
+                key, sub = jr.split(key)
+                perm = jr.permutation(sub, jnp.array(candidates))
+                S = sorted(int(x) for x in perm[:target_size].tolist())
             else:
-                break
+                S = []
+        else:
+            raise ValueError(f"Unknown s_mode: {s_mode!r}")
         S.sort()
 
         V_list = []
@@ -196,14 +224,32 @@ class ResErrorNetVariant:
             key, sub = jr.split(key)
             V_list.append(v_init_scale * jr.normal(sub, (dims[i], dims[output_idx])))
 
+        # Per-layer forward-pass scalings. Under "sp" all are 1.0 (no-op);
+        # under "mupc" we use the recipe from Innocenti et al. 2025:
+        #   input  = 1/√D, hidden = 1/√N (or 1/√(N·L) when forward skips
+        #   are active), output = 1/N.
+        if param_type == "mupc":
+            D = input_dim
+            N = width
+            L = depth
+            in_scale = D ** -0.5
+            hid_scale = (N * L) ** -0.5 if forward_skip_every > 0 else N ** -0.5
+            out_scale = 1.0 / N
+            param_scalings = [in_scale] + [hid_scale] * (L - 2) + [out_scale]
+        else:
+            param_scalings = [1.0] * depth
+
         return {
             "model": model,
             "V_list": V_list,
             "highway_indices": S,
             "highway_every_k": highway_every_k,
+            "s_mode": s_mode,
             "forward_skip_every": forward_skip_every,
             "v_init_scale": v_init_scale,
             "init_scheme": init_scheme,
+            "param_type": param_type,
+            "param_scalings": param_scalings,
             "act_fn": act_fn_callable,
             "act_fn_name": act_fn,
             "depth": depth,
@@ -242,9 +288,10 @@ class ResErrorNetVariant:
         return new_layers
 
     @staticmethod
-    def _reinit_unit_gaussian(model, key):
+    def _reinit_unit_gaussian(model, key, include_output=False):
         new_layers = list(model)
-        for l in range(len(new_layers) - 1):
+        upper = len(new_layers) if include_output else len(new_layers) - 1
+        for l in range(upper):
             seq = new_layers[l]
             linear = seq.layers[1]
             key, sub = jr.split(key)
@@ -269,24 +316,30 @@ class ResErrorNetVariant:
         act_fn = bundle["act_fn"]
         n = bundle.get("forward_skip_every", 0)
         L = bundle["depth"]
+        scalings = bundle.get("param_scalings", [1.0] * L)
 
         z = [None] * L
         h = [None] * L
         z_prev = x_batch
         for l in range(L):
-            h[l] = vmap(model[l])(z_prev)
+            h[l] = scalings[l] * vmap(model[l])(z_prev)
             z_pred = vmap(act_fn)(h[l]) if l < L - 1 else h[l]
             z[l] = self._add_forward_skip(z_pred, z, l, n)
             z_prev = z[l]
         return z, h
 
     @staticmethod
-    def _predictions_and_errors(model, z_list, x_batch, act_fn, L, forward_skip_every=0):
+    def _predictions_and_errors(
+        model, z_list, x_batch, act_fn, L,
+        forward_skip_every=0, scalings=None,
+    ):
+        if scalings is None:
+            scalings = [1.0] * L
         mu = [None] * L
         h = [None] * L
         for l in range(L):
             prev = x_batch if l == 0 else z_list[l - 1]
-            h[l] = vmap(model[l])(prev)
+            h[l] = scalings[l] * vmap(model[l])(prev)
             mu_pred = vmap(act_fn)(h[l]) if l < L - 1 else h[l]
             mu[l] = ResErrorNetVariant._add_forward_skip(
                 mu_pred, z_list, l, forward_skip_every
@@ -299,10 +352,11 @@ class ResErrorNetVariant:
         act_fn = bundle["act_fn"]
         n = bundle.get("forward_skip_every", 0)
         L = bundle["depth"]
+        scalings = bundle.get("param_scalings", [1.0] * L)
         z_list = list(z)
         z_list[L - 1] = y_batch
         e, _, _ = self._predictions_and_errors(
-            model, z_list, x_batch, act_fn, L, n
+            model, z_list, x_batch, act_fn, L, n, scalings
         )
         return e
 
@@ -334,10 +388,11 @@ class ResErrorNetVariant:
         L = bundle["depth"]
         S = bundle["highway_indices"]
         V_list = bundle["V_list"]
+        scalings = bundle.get("param_scalings", [1.0] * L)
 
         z_list = list(z_free) + [y_batch]
         e, _, _ = self._predictions_and_errors(
-            model, z_list, x_batch, act_fn, L, n
+            model, z_list, x_batch, act_fn, L, n, scalings
         )
         return self._F_pc(e) + self._F_highway(z_list, e, V_list, S, alpha, L)
 
@@ -403,6 +458,79 @@ class ResErrorNetVariant:
                 ))
         return z, energies
 
+    # ------------------------------------------------------------------
+    # Inference diagnostic
+    # ------------------------------------------------------------------
+
+    def diagnose_inference(self, bundle, x_batch, y_batch, alpha, dt, T,
+                           loss_type="mse"):
+        """Eager T-step inference with per-step (F, loss, acc) trajectory.
+
+        Returns dict with keys "energy", "loss", "acc", each a list of length
+        T+1: index 0 is the post-clamp pre-inference state (z = feed-forward,
+        z[L-1] := y), indices 1..T are after each inference step.
+
+        loss/acc are computed on μ^L = forward(z^{L-2}) — the model's
+        predicted output given the current internal state — not on the
+        clamped z[L-1] (which would trivially match y).
+        """
+        model = bundle["model"]
+        act_fn = bundle["act_fn"]
+        n = bundle.get("forward_skip_every", 0)
+        L = bundle["depth"]
+        method = bundle.get("inference_method", "euler")
+        b1 = bundle.get("inference_b1", 0.9)
+        b2 = bundle.get("inference_b2", 0.999)
+        eps = bundle.get("inference_eps", 1e-8)
+
+        z_init, _ = self.forward_pass(bundle, x_batch)
+        z = list(z_init)
+        z[L - 1] = y_batch
+
+        def snap(z_state):
+            z_free = [z_state[l] for l in range(L - 1)]
+            F = float(self.free_energy_z(
+                z_free, bundle, x_batch, y_batch, alpha
+            ))
+            _, mu, _ = self._predictions_and_errors(
+                model, list(z_state), x_batch, act_fn, L, n,
+                bundle.get("param_scalings", [1.0] * L),
+            )
+            mu_L = mu[L - 1]
+            if loss_type == "ce":
+                loss = float(jpc.cross_entropy_loss(mu_L, y_batch))
+            else:
+                loss = float(jpc.mse_loss(mu_L, y_batch))
+            acc = float(jnp.mean(
+                jnp.argmax(mu_L, axis=1) == jnp.argmax(y_batch, axis=1)
+            ) * 100)
+            return F, loss, acc
+
+        energies, losses, accs = [], [], []
+        F, ll, ac = snap(z)
+        energies.append(F); losses.append(ll); accs.append(ac)
+
+        if method == "adam":
+            m = [jnp.zeros_like(z[l]) for l in range(L - 1)]
+            v = [jnp.zeros_like(z[l]) for l in range(L - 1)]
+            t_count = jnp.zeros((), dtype=jnp.int32)
+            for _ in range(T):
+                z, m, v, t_count = _jit_inference_step_adam(
+                    self, bundle, z, m, v, t_count,
+                    x_batch, y_batch, alpha, dt, b1, b2, eps,
+                )
+                F, ll, ac = snap(z)
+                energies.append(F); losses.append(ll); accs.append(ac)
+        else:
+            for _ in range(T):
+                z = self.inference_step(
+                    bundle, z, x_batch, y_batch, alpha, dt
+                )
+                F, ll, ac = snap(z)
+                energies.append(F); losses.append(ll); accs.append(ac)
+
+        return {"energy": energies, "loss": losses, "acc": accs}
+
     # --- Parameter updates ---
 
     def compute_W_updates(self, bundle, z, x_batch, y_batch):
@@ -421,11 +549,14 @@ class ResErrorNetVariant:
         V_list = bundle["V_list"]
         alpha = bundle.get("alpha_for_w_grad", None)
 
+        scalings = bundle.get("param_scalings", [1.0] * L)
         z_list = list(z)
         z_list[L - 1] = y_batch
 
         def aug_energy(model_):
-            e, _, _ = self._predictions_and_errors(model_, z_list, x_batch, act_fn, L)
+            e, _, _ = self._predictions_and_errors(
+                model_, z_list, x_batch, act_fn, L, scalings=scalings,
+            )
             f = self._F_pc(e)
             if alpha is not None and S:
                 f = f + self._F_highway(z_list, e, V_list, S, alpha, L)
@@ -505,6 +636,21 @@ class ResErrorNetVariant:
             {**bundle, "model": model, "V_list": V_list},
             w_opt_state, v_opt_state,
         )
+
+    def apply_optax_updates_w_only(self, bundle, delta_W, w_optim, w_opt_state):
+        model = list(bundle["model"])
+
+        for l in range(len(model)):
+            layer = model[l]
+            linear = layer.layers[1]
+            updates, w_opt_state[l] = w_optim.update(
+                delta_W[l], w_opt_state[l], linear.weight
+            )
+            new_weight = linear.weight + updates
+            new_linear = eqx.tree_at(lambda lin: lin.weight, linear, new_weight)
+            model[l] = eqx.tree_at(lambda seq: seq.layers[1], layer, new_linear)
+
+        return {**bundle, "model": model}, w_opt_state
 
     def apply_sgd_updates(self, bundle, delta_W, delta_V, lr_W, lr_V):
         model = list(bundle["model"])

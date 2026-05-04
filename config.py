@@ -122,8 +122,8 @@ class ExperimentConfig:
     # training. Pass --alpha-e-skip 0.19 --alpha-e-adj 0.24 to opt back in.
     alpha_e_skip: float = 1.0
     alpha_e_adj: float = 1.0
-    reproject_c: float = 1.0          # Per-leaf Gaussian-ball update radius (0 disables)
-    global_clip_norm: float = 10.0    # Global-norm clipping threshold for delta_W (res-error-net only; 0 disables)
+    reproject_c: float = 0        # Per-leaf Gaussian-ball update radius (0 disables)
+    global_clip_norm: float = 0    # Global-norm clipping threshold for delta_W (res-error-net only; 0 disables)
     input_noise_sigma: float = 0.1
     weight_decay: float = 1e-4
     use_layer_norm: bool = True
@@ -144,23 +144,33 @@ class ExperimentConfig:
     # 0 disables skips; n>0 adds z^{l-n} into the prediction of layer l when
     # dimensions match.
     res_forward_skip_every: int = 0
-    res_alpha: float = 1
+    res_alpha: float = 0.1
     res_inference_T: int = 100
-    res_inference_dt: float = 0.1
+    res_inference_dt: float = 0.5
     # "euler" → plain gradient flow ż = -∂F/∂z (sensitive to dt).
     # "adam"  → per-coordinate adaptive Adam-on-z; dt is treated as a
     # learning rate, much more robust to its value.
     res_inference_method: str = "euler"
     res_v_lr: float = 1e-4
-    res_v_update_rule: str = "energy"   # "energy" or "state"
+    res_v_update_rule: str = "state"   # "energy" or "state"
     res_v_init_scale: float = 0.01
     res_output_clamp: str = "hard"       # soft reserved for future
     res_optim: str = "adamw"
     res_loss: str = "mse"
     res_init_scheme: str = "jpc_default"  # "jpc_default" or "unit_gaussian"
+    # "sp" (standard) or "mupc" (μPC). When "mupc", per-layer scalings
+    # (1/√D, 1/√N, …, 1/N) are applied in the forward pass and weights are
+    # re-initialised as N(0, 1); this overrides res_init_scheme.
+    res_param_type: str = "sp"
     # L2 penalty ρ on V_{L→i}. Adds (ρ/2)·Σ‖V‖² to F_aug so ΔV gains a +ρ·V
     # term, keeping V bounded and F bounded below in V.
-    res_v_reg: float = 0.1
+    res_v_reg: float = 1
+
+    # Ablation knobs
+    res_alpha_schedule: str = "fixed"      # "fixed" | "linear" | "cosine"
+    res_alpha_min: float = 0.0             # endpoint of decay schedules
+    res_v_frozen: bool = False             # DFA-style: V never updated
+    res_highway_s_mode: str = "stride"     # "stride" | "dense" | "sparse" | "random"
 
     # res-error-net-resnet18 specific (CIFAR-10 ResNet-18 backbone)
     # Strength of the highway term in the augmented free energy. Larger values

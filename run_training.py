@@ -10,10 +10,11 @@ Usage:
     python run_training.py --variant resnet --no-wandb   # disable W&B
 """
 import os
-os.environ['JAX_PLATFORMS'] = 'cpu'
+import common.jax_setup  # Configure JAX platform before importing jax.
 
 import argparse
 import numpy as np
+import jax
 import jax.random as jr
 
 from config import (
@@ -28,6 +29,24 @@ from training.res_error_net_trainer import train_res_error_net
 from common.data import set_seed
 from common.utils import ensure_dir
 from plotting.plots import generate_all_plots
+
+
+def report_jax_backend():
+    """Print the active JAX backend and selected devices."""
+    devices = jax.devices()
+    backend = jax.default_backend()
+    device_summary = ", ".join(str(device) for device in devices)
+    using_gpu = any(
+        getattr(device, "platform", "") in {"gpu", "cuda"}
+        for device in devices
+    )
+
+    print(f"JAX backend: {backend}")
+    print(f"JAX devices: {device_summary}")
+    if os.environ.get("JAX_PLATFORMS"):
+        print(f"JAX_PLATFORMS: {os.environ['JAX_PLATFORMS']}")
+    if not using_gpu:
+        print("WARNING: JAX did not select a GPU; this run is using CPU.")
 
 
 def run_single(cfg):
@@ -68,6 +87,9 @@ def run_single(cfg):
                     highway_every_k=cfg.res_highway_every_k,
                     v_init_scale=cfg.res_v_init_scale,
                     res_init_scheme=cfg.res_init_scheme,
+                    inference_method=cfg.res_inference_method,
+                    s_mode=cfg.res_highway_s_mode,
+                    res_param_type=cfg.res_param_type,
                 )
             if cfg.variant == VARIANT_RES_ERROR_NET_RESNET18:
                 extra_create_kwargs = dict(
@@ -78,6 +100,7 @@ def run_single(cfg):
                     dyt_init_alpha=cfg.res_resnet_dyt_init_alpha,
                     highway_include_stem=cfg.res_resnet_highway_include_stem,
                     v_init_scale=cfg.res_v_init_scale,
+                    inference_method=cfg.res_resnet_inference_method,
                 )
 
             model = variant.create_model(
@@ -126,6 +149,9 @@ def run_single(cfg):
                     track_grad_norms=cfg.track_grad_norms,
                     track_layer_energy=cfg.track_layer_energy,
                     use_wandb=use_wandb,
+                    alpha_schedule=cfg.res_alpha_schedule,
+                    alpha_min=cfg.res_alpha_min,
+                    freeze_v=cfg.res_v_frozen,
                 )
             elif cfg.variant in (VARIANT_REC_LRA, VARIANT_CNN_REC_LRA):
                 res = train_rec_lra(
@@ -380,6 +406,28 @@ def main():
         help="L2 penalty ρ on V highway matrices (res-error-net, default: 0.0). "
              "Adds ρ·V to ΔV so F_aug is bounded below in V.",
     )
+    # Ablation knobs (res-error-net)
+    parser.add_argument(
+        "--res-alpha-schedule",
+        choices=["fixed", "linear", "cosine"], default=None,
+        help="Per-iter α schedule for the highway coupling (default: fixed).",
+    )
+    parser.add_argument(
+        "--res-alpha-min", type=float, default=None,
+        help="Endpoint α for linear/cosine decay (default: 0.0).",
+    )
+    parser.add_argument(
+        "--res-v-frozen", action="store_true",
+        help="DFA-style: freeze V_{L→i} at init, never update.",
+    )
+    parser.add_argument(
+        "--res-highway-s-mode",
+        choices=["stride", "dense", "sparse", "random"], default=None,
+        help="How to choose S (the set of layers receiving V highways): "
+             "'stride' uses --res-highway-every-k (default), 'dense' = all "
+             "hidden layers, 'sparse' = only the layer just below output, "
+             "'random' = sample |S|≈depth/k layers at init.",
+    )
     # res-error-net-resnet18 arguments
     parser.add_argument(
         "--res-resnet-channels", type=int, nargs="+", default=None,
@@ -533,6 +581,14 @@ def main():
             overrides["res_init_scheme"] = args.res_init_scheme
         if args.res_v_reg is not None:
             overrides["res_v_reg"] = args.res_v_reg
+        if args.res_alpha_schedule is not None:
+            overrides["res_alpha_schedule"] = args.res_alpha_schedule
+        if args.res_alpha_min is not None:
+            overrides["res_alpha_min"] = args.res_alpha_min
+        if args.res_v_frozen:
+            overrides["res_v_frozen"] = True
+        if args.res_highway_s_mode is not None:
+            overrides["res_highway_s_mode"] = args.res_highway_s_mode
         if args.res_resnet_channels:
             overrides["res_resnet_channels"] = args.res_resnet_channels
         if args.res_resnet_blocks_per_stage is not None:
@@ -573,6 +629,7 @@ def main():
         print(f"Iterations: {cfg.n_train_iters}")
         print(f"Results dir: {cfg.results_dir}")
         print(f"W&B: {'enabled' if cfg.use_wandb else 'disabled'}")
+        report_jax_backend()
         print(f"{'='*60}")
         run_single(cfg)
 
