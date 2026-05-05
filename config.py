@@ -144,14 +144,14 @@ class ExperimentConfig:
     # 0 disables skips; n>0 adds z^{l-n} into the prediction of layer l when
     # dimensions match.
     res_forward_skip_every: int = 0
-    res_alpha: float = 0.1
-    res_inference_T: int = 100
-    res_inference_dt: float = 0.5
+    res_alpha: float = 1
+    res_inference_T: int = 30
+    res_inference_dt: float = 0.01
     # "euler" → plain gradient flow ż = -∂F/∂z (sensitive to dt).
     # "adam"  → per-coordinate adaptive Adam-on-z; dt is treated as a
     # learning rate, much more robust to its value.
-    res_inference_method: str = "euler"
-    res_v_lr: float = 1e-4
+    res_inference_method: str = "adam"
+    res_v_lr: float = 1e-5
     res_v_update_rule: str = "state"   # "energy" or "state"
     res_v_init_scale: float = 0.01
     res_output_clamp: str = "hard"       # soft reserved for future

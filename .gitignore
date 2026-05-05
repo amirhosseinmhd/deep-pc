@@ -16,3 +16,32 @@ __pycache__/
 .DS_Store
 data/
 wandb/
+
+# Log files
+*.log
+logs/
+**/logs/
+
+# JAX compilation cache
+.jax_cache/
+
+# Diagnostic output directories
+diagnostics_*/
+
+# Result/export tables
+*.tsv
+sweep_results.csv
+wandb_export_*.csv
+
+# Captured shell output
+output.txt
+
+# Temporary wait/poll scripts
+wait_*.py
+wait_*.sh
+simple_wait_*.sh
+wait_then_*.sh
+
+# Ad-hoc test scripts
+test_*.sh
+test_stability_fixes.py
