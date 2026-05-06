@@ -141,6 +141,11 @@ def train_res_error_net(
             v_optim = optax.adam(v_lr, eps=1e-12)
         w_opt_state = variant.init_w_optim_states(bundle, w_optim)
         v_opt_state = variant.init_v_optim_states(bundle, v_optim)
+        # DyT params (if any) share the W optimizer / LR.
+        if hasattr(variant, "init_dyt_optim_states"):
+            dyt_opt_state = variant.init_dyt_optim_states(bundle, w_optim)
+        else:
+            dyt_opt_state = []
 
     noise_key = jr.PRNGKey(seed + 1)
 
@@ -249,10 +254,16 @@ def train_res_error_net(
                 )
                 metrics.energy_per_layer.append(energies_jax.tolist())
 
-            # --- Step 4: ΔW from F_pc autodiff ---
-            delta_W = _jit_compute_W_updates(
+            # --- Step 4: ΔW (and ΔDyT if enabled) from F_pc autodiff ---
+            wupd = _jit_compute_W_updates(
                 variant, bundle, z, img_batch, label_batch, alpha_t
             )
+            # MLP variant returns (delta_W, delta_dyt); resnet18 sibling
+            # returns a flat list. Detect by inspecting the first element.
+            if isinstance(wupd, tuple) and len(wupd) == 2 and isinstance(wupd[0], list):
+                delta_W, delta_dyt = wupd
+            else:
+                delta_W, delta_dyt = wupd, []
 
             # --- Step 5: ΔV per configured rule (+ optional L2 on V) ---
             if freeze_v:
@@ -296,20 +307,43 @@ def train_res_error_net(
             metrics.grad_norms.append(grad_norms_jax.tolist())
 
         # --- Step 7: Apply ---
+        # MLP res-error-net (with DyT support) accepts extra kwargs and
+        # returns one extra opt-state. The resnet18 sibling has the legacy
+        # signatures — only thread DyT through variants that opted in.
+        has_dyt = hasattr(variant, "init_dyt_optim_states")
         if use_optax:
             if freeze_v:
-                bundle, w_opt_state = variant.apply_optax_updates_w_only(
-                    bundle, delta_W, w_optim, w_opt_state,
+                if has_dyt:
+                    bundle, w_opt_state, dyt_opt_state = variant.apply_optax_updates_w_only(
+                        bundle, delta_W, w_optim, w_opt_state,
+                        delta_dyt=delta_dyt, dyt_opt_state=dyt_opt_state,
+                    )
+                else:
+                    bundle, w_opt_state = variant.apply_optax_updates_w_only(
+                        bundle, delta_W, w_optim, w_opt_state,
+                    )
+            else:
+                if has_dyt:
+                    bundle, w_opt_state, v_opt_state, dyt_opt_state = variant.apply_optax_updates(
+                        bundle, delta_W, delta_V,
+                        w_optim, w_opt_state, v_optim, v_opt_state,
+                        delta_dyt=delta_dyt, dyt_opt_state=dyt_opt_state,
+                    )
+                else:
+                    bundle, w_opt_state, v_opt_state = variant.apply_optax_updates(
+                        bundle, delta_W, delta_V,
+                        w_optim, w_opt_state, v_optim, v_opt_state,
+                    )
+        else:
+            if has_dyt:
+                bundle = variant.apply_sgd_updates(
+                    bundle, delta_W, delta_V, param_lr, (0.0 if freeze_v else v_lr),
+                    delta_dyt=delta_dyt,
                 )
             else:
-                bundle, w_opt_state, v_opt_state = variant.apply_optax_updates(
-                    bundle, delta_W, delta_V,
-                    w_optim, w_opt_state, v_optim, v_opt_state,
+                bundle = variant.apply_sgd_updates(
+                    bundle, delta_W, delta_V, param_lr, (0.0 if freeze_v else v_lr),
                 )
-        else:
-            bundle = variant.apply_sgd_updates(
-                bundle, delta_W, delta_V, param_lr, (0.0 if freeze_v else v_lr)
-            )
 
         if track_activity_norms:
             metrics.record_activity_norms_post(z)
@@ -356,6 +390,20 @@ def train_res_error_net(
                 for i, val in enumerate(last_e):
                     name = activity_labels[i] if i < len(activity_labels) else f"layer{i+1}"
                     wb_metrics[f"energy/{name}"] = val
+
+            # Per-layer activity norms — mean over batch of ‖z[l]‖₂.
+            # `pre` = feed-forward init (before clamp); `post` = after T
+            # inference steps (the converged states the W/V update sees).
+            if track_activity_norms and metrics.activity_norms_init:
+                last_an_pre = metrics.activity_norms_init[-1]
+                for i, val in enumerate(last_an_pre):
+                    name = activity_labels[i] if i < len(activity_labels) else f"layer{i+1}"
+                    wb_metrics[f"activity_norm_pre/{name}"] = val
+            if track_activity_norms and metrics.activity_norms_post:
+                last_an_post = metrics.activity_norms_post[-1]
+                for i, val in enumerate(last_an_post):
+                    name = activity_labels[i] if i < len(activity_labels) else f"layer{i+1}"
+                    wb_metrics[f"activity_norm_post/{name}"] = val
 
             # V-highway norms
             V_arrays = variant.get_V_arrays(bundle)

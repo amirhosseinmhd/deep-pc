@@ -36,6 +36,7 @@ import jpc
 
 from config import INPUT_DIM as _DEFAULT_INPUT_DIM, OUTPUT_DIM as _DEFAULT_OUTPUT_DIM
 from common.utils import get_weight_list
+from variants.dyt import DyTLayer
 
 
 # Module-level JIT helpers. eqx.filter_jit auto-partitions args: jax arrays →
@@ -167,6 +168,16 @@ class ResErrorNetVariant:
         inference_b1 = kwargs.get("inference_b1", 0.9)
         inference_b2 = kwargs.get("inference_b2", 0.999)
         inference_eps = kwargs.get("inference_eps", 1e-8)
+        # DyT (Dynamic Tanh) normalization. dyt_norm ∈ {"off","pre","post"}.
+        # pre  → DyT applied to a layer's input (feature dim = prev width)
+        # post → DyT applied after the activation (feature dim = this width)
+        # dyt_layers ∈ {"hidden","all_internal"} or an explicit list of layer
+        # indices; the output layer L-1 is always excluded.
+        dyt_norm = kwargs.get("dyt_norm", "off")
+        dyt_init_alpha = kwargs.get("dyt_init_alpha", 0.5)
+        dyt_layers_spec = kwargs.get("dyt_layers", "hidden")
+        if dyt_norm not in ("off", "pre", "post"):
+            raise ValueError(f"Unknown dyt_norm: {dyt_norm!r}")
 
         key, subkey = jr.split(key)
         model = jpc.make_mlp(
@@ -224,6 +235,32 @@ class ResErrorNetVariant:
             key, sub = jr.split(key)
             V_list.append(v_init_scale * jr.normal(sub, (dims[i], dims[output_idx])))
 
+        # DyT layer construction. Built per active layer index; feature dim
+        # depends on placement (pre = previous-layer width, post = this layer's
+        # width). Output layer is always excluded — z[L-1] is hard-clamped to
+        # y, and DyT'ing the prediction would distort the supervision signal.
+        if dyt_norm == "off":
+            dyt_indices = []
+            dyt_list = []
+        else:
+            if dyt_layers_spec == "hidden":
+                candidate_layers = list(range(1, depth - 1))
+            elif dyt_layers_spec == "all_internal":
+                candidate_layers = list(range(0, depth - 1))
+            elif isinstance(dyt_layers_spec, (list, tuple)):
+                candidate_layers = [int(i) for i in dyt_layers_spec
+                                    if 0 <= int(i) <= depth - 2]
+            else:
+                raise ValueError(f"Unknown dyt_layers: {dyt_layers_spec!r}")
+            dyt_indices = sorted(set(candidate_layers))
+            dyt_list = []
+            for li in dyt_indices:
+                if dyt_norm == "pre":
+                    feat = input_dim if li == 0 else width
+                else:  # post
+                    feat = output_dim if li == depth - 1 else width
+                dyt_list.append(DyTLayer(feat, init_alpha=dyt_init_alpha))
+
         # Per-layer forward-pass scalings. Under "sp" all are 1.0 (no-op);
         # under "mupc" we use the recipe from Innocenti et al. 2025:
         #   input  = 1/√D, hidden = 1/√N (or 1/√(N·L) when forward skips
@@ -258,6 +295,9 @@ class ResErrorNetVariant:
             "inference_b1": inference_b1,
             "inference_b2": inference_b2,
             "inference_eps": inference_eps,
+            "dyt_norm": dyt_norm,
+            "dyt_indices": dyt_indices,
+            "dyt_list": dyt_list,
         }
 
     @staticmethod
@@ -311,19 +351,36 @@ class ResErrorNetVariant:
             return pred
         return pred + src
 
+    @staticmethod
+    def _maybe_dyt(x, layer_idx, dyt_norm, dyt_indices, dyt_list, position):
+        """Apply DyT[layer_idx] iff dyt_norm == position and layer_idx is active."""
+        if dyt_norm != position or not dyt_indices:
+            return x
+        if layer_idx not in dyt_indices:
+            return x
+        idx = dyt_indices.index(layer_idx)
+        return vmap(dyt_list[idx])(x)
+
     def forward_pass(self, bundle, x_batch):
         model = bundle["model"]
         act_fn = bundle["act_fn"]
         n = bundle.get("forward_skip_every", 0)
         L = bundle["depth"]
         scalings = bundle.get("param_scalings", [1.0] * L)
+        dyt_norm = bundle.get("dyt_norm", "off")
+        dyt_indices = bundle.get("dyt_indices", [])
+        dyt_list = bundle.get("dyt_list", [])
 
         z = [None] * L
         h = [None] * L
         z_prev = x_batch
         for l in range(L):
-            h[l] = scalings[l] * vmap(model[l])(z_prev)
+            z_in = self._maybe_dyt(z_prev, l, dyt_norm, dyt_indices, dyt_list, "pre")
+            h[l] = scalings[l] * vmap(model[l])(z_in)
             z_pred = vmap(act_fn)(h[l]) if l < L - 1 else h[l]
+            z_pred = self._maybe_dyt(
+                z_pred, l, dyt_norm, dyt_indices, dyt_list, "post"
+            )
             z[l] = self._add_forward_skip(z_pred, z, l, n)
             z_prev = z[l]
         return z, h
@@ -332,15 +389,26 @@ class ResErrorNetVariant:
     def _predictions_and_errors(
         model, z_list, x_batch, act_fn, L,
         forward_skip_every=0, scalings=None,
+        dyt_norm="off", dyt_indices=None, dyt_list=None,
     ):
         if scalings is None:
             scalings = [1.0] * L
+        if dyt_indices is None:
+            dyt_indices = []
+        if dyt_list is None:
+            dyt_list = []
         mu = [None] * L
         h = [None] * L
         for l in range(L):
             prev = x_batch if l == 0 else z_list[l - 1]
+            prev = ResErrorNetVariant._maybe_dyt(
+                prev, l, dyt_norm, dyt_indices, dyt_list, "pre"
+            )
             h[l] = scalings[l] * vmap(model[l])(prev)
             mu_pred = vmap(act_fn)(h[l]) if l < L - 1 else h[l]
+            mu_pred = ResErrorNetVariant._maybe_dyt(
+                mu_pred, l, dyt_norm, dyt_indices, dyt_list, "post"
+            )
             mu[l] = ResErrorNetVariant._add_forward_skip(
                 mu_pred, z_list, l, forward_skip_every
             )
@@ -353,10 +421,14 @@ class ResErrorNetVariant:
         n = bundle.get("forward_skip_every", 0)
         L = bundle["depth"]
         scalings = bundle.get("param_scalings", [1.0] * L)
+        dyt_norm = bundle.get("dyt_norm", "off")
+        dyt_indices = bundle.get("dyt_indices", [])
+        dyt_list = bundle.get("dyt_list", [])
         z_list = list(z)
         z_list[L - 1] = y_batch
         e, _, _ = self._predictions_and_errors(
-            model, z_list, x_batch, act_fn, L, n, scalings
+            model, z_list, x_batch, act_fn, L, n, scalings,
+            dyt_norm, dyt_indices, dyt_list,
         )
         return e
 
@@ -389,10 +461,14 @@ class ResErrorNetVariant:
         S = bundle["highway_indices"]
         V_list = bundle["V_list"]
         scalings = bundle.get("param_scalings", [1.0] * L)
+        dyt_norm = bundle.get("dyt_norm", "off")
+        dyt_indices = bundle.get("dyt_indices", [])
+        dyt_list = bundle.get("dyt_list", [])
 
         z_list = list(z_free) + [y_batch]
         e, _, _ = self._predictions_and_errors(
-            model, z_list, x_batch, act_fn, L, n, scalings
+            model, z_list, x_batch, act_fn, L, n, scalings,
+            dyt_norm, dyt_indices, dyt_list,
         )
         return self._F_pc(e) + self._F_highway(z_list, e, V_list, S, alpha, L)
 
@@ -534,13 +610,17 @@ class ResErrorNetVariant:
     # --- Parameter updates ---
 
     def compute_W_updates(self, bundle, z, x_batch, y_batch):
-        """∂F_aug/∂W^l via autodiff.
+        """∂F_aug/∂W^l (and ∂F_aug/∂DyT params) via autodiff.
 
         Under the new highway energy F_hw = α·Σ z^i·(sg(e^L) @ V_iᵀ), z is
         constant w.r.t. model params and stop_gradient blocks flow through
         e^L, so F_hw contributes 0 to ∂F/∂W. The W update therefore
         reduces to ∂F_pc/∂W (we still go through the augmented closure for
         symmetry with free_energy_z and to keep the API uniform).
+
+        When DyT is enabled, gradients also flow into the DyT layers' (α, γ,
+        β) parameters. Returns `(delta_W, delta_dyt)` — `delta_dyt` is an
+        empty list when `dyt_norm == "off"`.
         """
         model = bundle["model"]
         act_fn = bundle["act_fn"]
@@ -550,26 +630,35 @@ class ResErrorNetVariant:
         alpha = bundle.get("alpha_for_w_grad", None)
 
         scalings = bundle.get("param_scalings", [1.0] * L)
+        dyt_norm = bundle.get("dyt_norm", "off")
+        dyt_indices = bundle.get("dyt_indices", [])
+        dyt_list = bundle.get("dyt_list", [])
         z_list = list(z)
         z_list[L - 1] = y_batch
 
-        def aug_energy(model_):
+        # eqx.filter_grad differentiates the first positional arg by default,
+        # so we pack (model, dyt_list) into a tuple to get gradients on both.
+        def aug_energy(params):
+            model_, dyt_list_ = params
             e, _, _ = self._predictions_and_errors(
-                model_, z_list, x_batch, act_fn, L, scalings=scalings,
+                model_, z_list, x_batch, act_fn, L,
+                scalings=scalings,
+                dyt_norm=dyt_norm, dyt_indices=dyt_indices,
+                dyt_list=dyt_list_,
             )
             f = self._F_pc(e)
             if alpha is not None and S:
                 f = f + self._F_highway(z_list, e, V_list, S, alpha, L)
             return f
 
-        grads_model = eqx.filter_grad(aug_energy)(model)
+        grads_model, grads_dyt = eqx.filter_grad(aug_energy)((model, dyt_list))
 
         delta_W = []
         for l in range(L):
             seq_grad = grads_model[l]
             linear_grad = seq_grad.layers[1]
             delta_W.append(linear_grad.weight)
-        return delta_W
+        return delta_W, list(grads_dyt)
 
     def compute_V_updates(self, bundle, z, x_batch, y_batch, alpha,
                           rule="energy", v_reg=0.0):
@@ -611,10 +700,16 @@ class ResErrorNetVariant:
     # --- Apply updates ---
 
     def apply_optax_updates(self, bundle, delta_W, delta_V,
-                            w_optim, w_opt_state, v_optim, v_opt_state):
+                            w_optim, w_opt_state, v_optim, v_opt_state,
+                            delta_dyt=None, dyt_opt_state=None):
         model = list(bundle["model"])
         V_list = list(bundle["V_list"])
         S = bundle["highway_indices"]
+        dyt_list = list(bundle.get("dyt_list", []))
+        if delta_dyt is None:
+            delta_dyt = []
+        if dyt_opt_state is None:
+            dyt_opt_state = []
 
         for l in range(len(model)):
             layer = model[l]
@@ -632,13 +727,26 @@ class ResErrorNetVariant:
             )
             V_list[idx] = V_list[idx] + updates
 
+        for idx in range(len(dyt_list)):
+            params = eqx.filter(dyt_list[idx], eqx.is_array)
+            updates, dyt_opt_state[idx] = w_optim.update(
+                delta_dyt[idx], dyt_opt_state[idx], params
+            )
+            dyt_list[idx] = eqx.apply_updates(dyt_list[idx], updates)
+
         return (
-            {**bundle, "model": model, "V_list": V_list},
-            w_opt_state, v_opt_state,
+            {**bundle, "model": model, "V_list": V_list, "dyt_list": dyt_list},
+            w_opt_state, v_opt_state, dyt_opt_state,
         )
 
-    def apply_optax_updates_w_only(self, bundle, delta_W, w_optim, w_opt_state):
+    def apply_optax_updates_w_only(self, bundle, delta_W, w_optim, w_opt_state,
+                                   delta_dyt=None, dyt_opt_state=None):
         model = list(bundle["model"])
+        dyt_list = list(bundle.get("dyt_list", []))
+        if delta_dyt is None:
+            delta_dyt = []
+        if dyt_opt_state is None:
+            dyt_opt_state = []
 
         for l in range(len(model)):
             layer = model[l]
@@ -650,12 +758,26 @@ class ResErrorNetVariant:
             new_linear = eqx.tree_at(lambda lin: lin.weight, linear, new_weight)
             model[l] = eqx.tree_at(lambda seq: seq.layers[1], layer, new_linear)
 
-        return {**bundle, "model": model}, w_opt_state
+        for idx in range(len(dyt_list)):
+            params = eqx.filter(dyt_list[idx], eqx.is_array)
+            updates, dyt_opt_state[idx] = w_optim.update(
+                delta_dyt[idx], dyt_opt_state[idx], params
+            )
+            dyt_list[idx] = eqx.apply_updates(dyt_list[idx], updates)
 
-    def apply_sgd_updates(self, bundle, delta_W, delta_V, lr_W, lr_V):
+        return (
+            {**bundle, "model": model, "dyt_list": dyt_list},
+            w_opt_state, dyt_opt_state,
+        )
+
+    def apply_sgd_updates(self, bundle, delta_W, delta_V, lr_W, lr_V,
+                         delta_dyt=None):
         model = list(bundle["model"])
         V_list = list(bundle["V_list"])
         S = bundle["highway_indices"]
+        dyt_list = list(bundle.get("dyt_list", []))
+        if delta_dyt is None:
+            delta_dyt = []
 
         for l in range(len(model)):
             layer = model[l]
@@ -667,7 +789,14 @@ class ResErrorNetVariant:
         for idx in range(len(S)):
             V_list[idx] = V_list[idx] - lr_V * delta_V[idx]
 
-        return {**bundle, "model": model, "V_list": V_list}
+        for idx in range(len(dyt_list)):
+            scaled = jax.tree_util.tree_map(
+                lambda g: -lr_W * g if eqx.is_array(g) else g,
+                delta_dyt[idx],
+            )
+            dyt_list[idx] = eqx.apply_updates(dyt_list[idx], scaled)
+
+        return {**bundle, "model": model, "V_list": V_list, "dyt_list": dyt_list}
 
     # --- Optimizer state init ---
 
@@ -680,6 +809,14 @@ class ResErrorNetVariant:
 
     def init_v_optim_states(self, bundle, v_optim):
         return [v_optim.init(V) for V in bundle["V_list"]]
+
+    def init_dyt_optim_states(self, bundle, dyt_optim):
+        """Per-DyT-layer optimizer state. Empty list when DyT is off — the
+        trainer then loops over zero entries, yielding a no-op."""
+        return [
+            dyt_optim.init(eqx.filter(dyt, eqx.is_array))
+            for dyt in bundle.get("dyt_list", [])
+        ]
 
     # --- Evaluation / introspection ---
 

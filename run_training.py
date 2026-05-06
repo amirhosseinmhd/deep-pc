@@ -90,6 +90,9 @@ def run_single(cfg):
                     inference_method=cfg.res_inference_method,
                     s_mode=cfg.res_highway_s_mode,
                     res_param_type=cfg.res_param_type,
+                    dyt_norm=cfg.res_dyt_norm,
+                    dyt_init_alpha=cfg.res_dyt_init_alpha,
+                    dyt_layers=cfg.res_dyt_layers,
                 )
             if cfg.variant == VARIANT_RES_ERROR_NET_RESNET18:
                 extra_create_kwargs = dict(
@@ -428,6 +431,23 @@ def main():
              "hidden layers, 'sparse' = only the layer just below output, "
              "'random' = sample |S|≈depth/k layers at init.",
     )
+    parser.add_argument(
+        "--res-dyt-norm", choices=["off", "pre", "post"], default=None,
+        help="DyT normalization for the MLP res-error-net. 'off' = no DyT "
+             "(default, bit-exact with prior runs). 'pre' = DyT applied to a "
+             "layer's input (before the linear). 'post' = DyT applied after "
+             "the activation. DyT params (α, γ, β) are trained jointly with W "
+             "via the augmented free energy.",
+    )
+    parser.add_argument(
+        "--res-dyt-init-alpha", type=float, default=None,
+        help="Initial scalar α inside each DyT layer (default: 0.5).",
+    )
+    parser.add_argument(
+        "--res-dyt-layers", default=None,
+        help="Which layers get a DyT module: 'hidden' (l=1..L-2) or "
+             "'all_internal' (l=0..L-2). Output layer always excluded.",
+    )
     # res-error-net-resnet18 arguments
     parser.add_argument(
         "--res-resnet-channels", type=int, nargs="+", default=None,
@@ -589,6 +609,12 @@ def main():
             overrides["res_v_frozen"] = True
         if args.res_highway_s_mode is not None:
             overrides["res_highway_s_mode"] = args.res_highway_s_mode
+        if args.res_dyt_norm is not None:
+            overrides["res_dyt_norm"] = args.res_dyt_norm
+        if args.res_dyt_init_alpha is not None:
+            overrides["res_dyt_init_alpha"] = args.res_dyt_init_alpha
+        if args.res_dyt_layers is not None:
+            overrides["res_dyt_layers"] = args.res_dyt_layers
         if args.res_resnet_channels:
             overrides["res_resnet_channels"] = args.res_resnet_channels
         if args.res_resnet_blocks_per_stage is not None:

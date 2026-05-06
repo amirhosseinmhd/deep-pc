@@ -172,6 +172,17 @@ class ExperimentConfig:
     res_v_frozen: bool = False             # DFA-style: V never updated
     res_highway_s_mode: str = "stride"     # "stride" | "dense" | "sparse" | "random"
 
+    # DyT (Dynamic Tanh) normalization for the MLP res-error-net.
+    # "off" → no DyT (default; bit-exact with prior runs).
+    # "pre" → DyT applied to a layer's input (before the linear).
+    # "post" → DyT applied to the layer output (after the activation).
+    res_dyt_norm: str = "off"
+    res_dyt_init_alpha: float = 0.5
+    # Which layers get a DyT module. "hidden" = layers 1..L-2; "all_internal"
+    # = layers 0..L-2. The output layer L-1 is always excluded (z[L-1] is
+    # hard-clamped to y, so DyT'ing the prediction would distort supervision).
+    res_dyt_layers: str = "hidden"
+
     # res-error-net-resnet18 specific (CIFAR-10 ResNet-18 backbone)
     # Strength of the highway term in the augmented free energy. Larger values
     # make the output-error shortcuts influence hidden-state inference more.
