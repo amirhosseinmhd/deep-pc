@@ -21,6 +21,7 @@ from config import (
     ExperimentConfig, ALL_VARIANTS,
     VARIANT_REC_LRA, VARIANT_CNN_REC_LRA, VARIANT_RES_ERROR_NET,
     VARIANT_RES_ERROR_NET_RESNET18,
+    VARIANT_RES_ERROR_NET_SIMPLE_CNN,
 )
 from variants import get_variant
 from training.trainer import train_and_record
@@ -93,6 +94,7 @@ def run_single(cfg):
                     dyt_norm=cfg.res_dyt_norm,
                     dyt_init_alpha=cfg.res_dyt_init_alpha,
                     dyt_layers=cfg.res_dyt_layers,
+                    loss_type=cfg.res_loss,
                 )
             if cfg.variant == VARIANT_RES_ERROR_NET_RESNET18:
                 extra_create_kwargs = dict(
@@ -105,6 +107,33 @@ def run_single(cfg):
                     v_init_scale=cfg.res_v_init_scale,
                     inference_method=cfg.res_resnet_inference_method,
                 )
+            if cfg.variant == VARIANT_RES_ERROR_NET_SIMPLE_CNN:
+                # Auto-derive input_shape from dataset when not explicitly set.
+                if cfg.res_simple_cnn_input_shape is not None:
+                    input_shape = tuple(cfg.res_simple_cnn_input_shape)
+                elif cfg.dataset in ("MNIST", "FashionMNIST"):
+                    input_shape = (1, 28, 28)
+                elif cfg.dataset == "CIFAR10":
+                    input_shape = (3, 32, 32)
+                else:
+                    raise ValueError(
+                        f"Cannot auto-derive input_shape for dataset "
+                        f"{cfg.dataset!r}; pass --res-simple-cnn-input-shape."
+                    )
+                extra_create_kwargs = dict(
+                    input_shape=input_shape,
+                    cnn_channels=cfg.res_simple_cnn_channels,
+                    cnn_strides=cfg.res_simple_cnn_strides,
+                    kernel_size=cfg.res_simple_cnn_kernel_size,
+                    normalization=cfg.res_simple_cnn_normalization,
+                    dyt_init_alpha=cfg.res_simple_cnn_dyt_init_alpha,
+                    dyt_position=cfg.res_simple_cnn_dyt_position,
+                    head_type=cfg.res_simple_cnn_head_type,
+                    highway_include_stem=cfg.res_simple_cnn_highway_include_stem,
+                    v_init_scale=cfg.res_simple_cnn_v_init_scale,
+                    inference_method=cfg.res_simple_cnn_inference_method,
+                    loss_type=cfg.res_loss,
+                )
 
             model = variant.create_model(
                 key, depth=depth, width=cfg.width, act_fn=act_fn,
@@ -116,14 +145,19 @@ def run_single(cfg):
                 **extra_create_kwargs,
             )
 
-            if cfg.variant in (VARIANT_RES_ERROR_NET, VARIANT_RES_ERROR_NET_RESNET18):
-                # CNN variant uses its own T default (each inference step is
-                # ~100× costlier than the MLP variant).
-                eff_T = (
-                    cfg.res_resnet_inference_T
-                    if cfg.variant == VARIANT_RES_ERROR_NET_RESNET18
-                    else cfg.res_inference_T
-                )
+            if cfg.variant in (
+                VARIANT_RES_ERROR_NET,
+                VARIANT_RES_ERROR_NET_RESNET18,
+                VARIANT_RES_ERROR_NET_SIMPLE_CNN,
+            ):
+                # CNN variants use their own T default (each inference step is
+                # ~10–100× costlier than the MLP variant).
+                if cfg.variant == VARIANT_RES_ERROR_NET_RESNET18:
+                    eff_T = cfg.res_resnet_inference_T
+                elif cfg.variant == VARIANT_RES_ERROR_NET_SIMPLE_CNN:
+                    eff_T = cfg.res_simple_cnn_inference_T
+                else:
+                    eff_T = cfg.res_inference_T
                 res = train_res_error_net(
                     variant=variant,
                     bundle=model,
@@ -475,6 +509,59 @@ def main():
         help="Inference steps for ResNet-18 variant (default: 15; the MLP "
              "variant uses 50 but each CNN step is ~100× more expensive)",
     )
+    # res-error-net-simple-cnn arguments (plain conv-stack)
+    parser.add_argument(
+        "--res-simple-cnn-channels", type=int, nargs="+", default=None,
+        help="Output channels per conv block for simple-cnn variant. First "
+             "entry is the stem, rest are conv blocks. Default: 16 32 64 "
+             "(3 blocks; MNIST: 28→28→14→7).",
+    )
+    parser.add_argument(
+        "--res-simple-cnn-strides", type=int, nargs="+", default=None,
+        help="Per-block strides; must match length of --res-simple-cnn-channels. "
+             "Default: 1 followed by 2's (stem full-res, others halve).",
+    )
+    parser.add_argument(
+        "--res-simple-cnn-kernel-size", type=int, default=None,
+        help="Conv kernel size for simple-cnn variant (default: 3).",
+    )
+    parser.add_argument(
+        "--res-simple-cnn-input-shape", type=int, nargs=3, default=None,
+        metavar=("C", "H", "W"),
+        help="Override input shape (C H W). Defaults: MNIST→1 28 28, CIFAR10→3 32 32.",
+    )
+    parser.add_argument(
+        "--res-simple-cnn-normalization", choices=["dyt", "none"], default=None,
+        help="Per-block normalization for simple-cnn (default: dyt).",
+    )
+    parser.add_argument(
+        "--res-simple-cnn-no-stem-highway", action="store_true",
+        help="Exclude the stem from the set of highway activities.",
+    )
+    parser.add_argument(
+        "--res-simple-cnn-inference-T", type=int, default=None,
+        help="Inference steps for simple-cnn variant (default: 20).",
+    )
+    parser.add_argument(
+        "--res-simple-cnn-inference-method",
+        choices=["euler", "adam"], default=None,
+        help="Inference method for simple-cnn variant (default: euler).",
+    )
+    parser.add_argument(
+        "--res-simple-cnn-dyt-init-alpha", type=float, default=None,
+        help="Initial scalar α inside each DyT layer (default: 0.5).",
+    )
+    parser.add_argument(
+        "--res-simple-cnn-dyt-position", choices=["pre", "post"], default=None,
+        help="DyT order in each block: 'pre' (conv→DyT→act) or 'post' "
+             "(conv→act→DyT, default — matches the user-validated MLP recipe).",
+    )
+    parser.add_argument(
+        "--res-simple-cnn-head-type", choices=["flatten", "gap"], default=None,
+        help="Head: 'flatten' = Linear(C·H·W→out) (default; gives the full "
+             "backward pull on z^{L-2} during inference). 'gap' = GAP+Linear; "
+             "pull is divided by H·W and inference struggles to settle.",
+    )
     # CNN-rec-LRA arguments
     parser.add_argument(
         "--cnn-channels", type=int, nargs="+", default=None,
@@ -593,6 +680,10 @@ def main():
             overrides["res_v_update_rule"] = args.res_v_update_rule
         if args.res_v_init_scale is not None:
             overrides["res_v_init_scale"] = args.res_v_init_scale
+            # Mirror to the simple-cnn-specific override so a user can use a
+            # single flag for both variants. Per the v_nonlearnable report,
+            # init scale governs frozen-V accuracy more than V learning does.
+            overrides["res_simple_cnn_v_init_scale"] = args.res_v_init_scale
         if args.res_optim is not None:
             overrides["res_optim"] = args.res_optim
         if args.res_loss is not None:
@@ -627,6 +718,28 @@ def main():
             overrides["res_resnet_highway_include_stem"] = False
         if args.res_resnet_inference_T is not None:
             overrides["res_resnet_inference_T"] = args.res_resnet_inference_T
+        if args.res_simple_cnn_channels is not None:
+            overrides["res_simple_cnn_channels"] = args.res_simple_cnn_channels
+        if args.res_simple_cnn_strides is not None:
+            overrides["res_simple_cnn_strides"] = args.res_simple_cnn_strides
+        if args.res_simple_cnn_kernel_size is not None:
+            overrides["res_simple_cnn_kernel_size"] = args.res_simple_cnn_kernel_size
+        if args.res_simple_cnn_input_shape is not None:
+            overrides["res_simple_cnn_input_shape"] = args.res_simple_cnn_input_shape
+        if args.res_simple_cnn_normalization is not None:
+            overrides["res_simple_cnn_normalization"] = args.res_simple_cnn_normalization
+        if args.res_simple_cnn_no_stem_highway:
+            overrides["res_simple_cnn_highway_include_stem"] = False
+        if args.res_simple_cnn_inference_T is not None:
+            overrides["res_simple_cnn_inference_T"] = args.res_simple_cnn_inference_T
+        if args.res_simple_cnn_inference_method is not None:
+            overrides["res_simple_cnn_inference_method"] = args.res_simple_cnn_inference_method
+        if args.res_simple_cnn_dyt_init_alpha is not None:
+            overrides["res_simple_cnn_dyt_init_alpha"] = args.res_simple_cnn_dyt_init_alpha
+        if args.res_simple_cnn_dyt_position is not None:
+            overrides["res_simple_cnn_dyt_position"] = args.res_simple_cnn_dyt_position
+        if args.res_simple_cnn_head_type is not None:
+            overrides["res_simple_cnn_head_type"] = args.res_simple_cnn_head_type
         if args.cnn_channels:
             overrides["cnn_channels"] = args.cnn_channels
         if args.cnn_fc_width:

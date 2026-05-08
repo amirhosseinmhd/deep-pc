@@ -150,6 +150,13 @@ class ResErrorNetVariant:
     def create_model(self, key, depth, width, act_fn, **kwargs):
         input_dim = kwargs.get("input_dim", _DEFAULT_INPUT_DIM)
         output_dim = kwargs.get("output_dim", _DEFAULT_OUTPUT_DIM)
+        # "mse" → top-layer energy is 0.5‖y - μ_L‖² (default).
+        # "ce"  → top-layer energy is CE(softmax(μ_L), y); the highway
+        # supervision signal e^L becomes (y - softmax(μ_L)) so V is updated
+        # against the CE gradient direction. Inner-layer PC errors stay MSE.
+        loss_type = kwargs.get("loss_type", "mse")
+        if loss_type not in ("mse", "ce"):
+            raise ValueError(f"Unknown loss_type: {loss_type!r}")
         highway_every_k = kwargs.get("highway_every_k", 2)
         s_mode = kwargs.get("s_mode", "stride")
         forward_skip_every = kwargs.get("forward_skip_every", 0)
@@ -298,6 +305,7 @@ class ResErrorNetVariant:
             "dyt_norm": dyt_norm,
             "dyt_indices": dyt_indices,
             "dyt_list": dyt_list,
+            "loss_type": loss_type,
         }
 
     @staticmethod
@@ -435,16 +443,37 @@ class ResErrorNetVariant:
     # --- Energy ---
 
     @staticmethod
-    def _F_pc(e_list):
-        return sum(0.5 * jnp.mean(jnp.sum(el ** 2, axis=1)) for el in e_list)
+    def _F_pc(e_list, mu_L=None, y=None, loss_type="mse"):
+        """Augmented PC energy. Inner layers always use MSE (0.5‖e‖²).
+
+        Top layer:
+          mse → 0.5‖y - μ_L‖²  (= 0.5‖e^L‖² with e^L = z[L-1] - μ_L = y - μ_L)
+          ce  → CE(softmax(μ_L), y)
+        """
+        inner = sum(0.5 * jnp.mean(jnp.sum(el ** 2, axis=1)) for el in e_list[:-1])
+        if loss_type == "ce":
+            return inner + jpc.cross_entropy_loss(mu_L, y)
+        return inner + 0.5 * jnp.mean(jnp.sum(e_list[-1] ** 2, axis=1))
 
     @staticmethod
-    def _F_highway(z_list, e_list, V_list, S, alpha, L):
+    def _highway_e_top(e_list, mu_L=None, y=None, loss_type="mse"):
+        """Supervision error at the top, used by F_highway and ΔV.
+
+        Sign convention matches `e^l = z^l - μ^l`:
+          mse → e^L = y - μ_L              (the existing e[-1])
+          ce  → e^L = y - softmax(μ_L)     (negative gradient of CE w.r.t. μ_L)
+        """
+        if loss_type == "ce":
+            return y - jax.nn.softmax(mu_L, axis=-1)
+        return e_list[-1]
+
+    @staticmethod
+    def _F_highway(z_list, e_top, V_list, S, alpha):
         if not S:
             return jnp.array(0.0)
         # stop_grad on e^L: highway no longer pulls z^{L-1} during inference;
         # z^{L-1} is shaped only by F_pc (i.e., aligns to the clamped target).
-        e_L = jax.lax.stop_gradient(e_list[L - 1])
+        e_L = jax.lax.stop_gradient(e_top)
         total = jnp.array(0.0)
         for idx, i in enumerate(S):
             Vi = V_list[idx]
@@ -464,13 +493,16 @@ class ResErrorNetVariant:
         dyt_norm = bundle.get("dyt_norm", "off")
         dyt_indices = bundle.get("dyt_indices", [])
         dyt_list = bundle.get("dyt_list", [])
+        loss_type = bundle.get("loss_type", "mse")
 
         z_list = list(z_free) + [y_batch]
-        e, _, _ = self._predictions_and_errors(
+        e, mu, _ = self._predictions_and_errors(
             model, z_list, x_batch, act_fn, L, n, scalings,
             dyt_norm, dyt_indices, dyt_list,
         )
-        return self._F_pc(e) + self._F_highway(z_list, e, V_list, S, alpha, L)
+        f_pc = self._F_pc(e, mu_L=mu[L - 1], y=y_batch, loss_type=loss_type)
+        e_top = self._highway_e_top(e, mu_L=mu[L - 1], y=y_batch, loss_type=loss_type)
+        return f_pc + self._F_highway(z_list, e_top, V_list, S, alpha)
 
     # --- Inference dynamics ---
 
@@ -633,6 +665,7 @@ class ResErrorNetVariant:
         dyt_norm = bundle.get("dyt_norm", "off")
         dyt_indices = bundle.get("dyt_indices", [])
         dyt_list = bundle.get("dyt_list", [])
+        loss_type = bundle.get("loss_type", "mse")
         z_list = list(z)
         z_list[L - 1] = y_batch
 
@@ -640,15 +673,18 @@ class ResErrorNetVariant:
         # so we pack (model, dyt_list) into a tuple to get gradients on both.
         def aug_energy(params):
             model_, dyt_list_ = params
-            e, _, _ = self._predictions_and_errors(
+            e, mu, _ = self._predictions_and_errors(
                 model_, z_list, x_batch, act_fn, L,
                 scalings=scalings,
                 dyt_norm=dyt_norm, dyt_indices=dyt_indices,
                 dyt_list=dyt_list_,
             )
-            f = self._F_pc(e)
+            f = self._F_pc(e, mu_L=mu[L - 1], y=y_batch, loss_type=loss_type)
             if alpha is not None and S:
-                f = f + self._F_highway(z_list, e, V_list, S, alpha, L)
+                e_top = self._highway_e_top(
+                    e, mu_L=mu[L - 1], y=y_batch, loss_type=loss_type,
+                )
+                f = f + self._F_highway(z_list, e_top, V_list, S, alpha)
             return f
 
         grads_model, grads_dyt = eqx.filter_grad(aug_energy)((model, dyt_list))
@@ -678,9 +714,30 @@ class ResErrorNetVariant:
         L = bundle["depth"]
         V_list = bundle["V_list"]
         batch_size = x_batch.shape[0]
+        loss_type = bundle.get("loss_type", "mse")
 
-        e = self.compute_errors(bundle, z, x_batch, y_batch)
-        e_L = e[L - 1]
+        # Need μ_L too under CE — compute_errors returns errors only, so we
+        # reuse _predictions_and_errors to grab mu in the CE branch.
+        if loss_type == "ce":
+            model = bundle["model"]
+            act_fn = bundle["act_fn"]
+            n = bundle.get("forward_skip_every", 0)
+            scalings = bundle.get("param_scalings", [1.0] * L)
+            dyt_norm = bundle.get("dyt_norm", "off")
+            dyt_indices = bundle.get("dyt_indices", [])
+            dyt_list = bundle.get("dyt_list", [])
+            z_list = list(z)
+            z_list[L - 1] = y_batch
+            e, mu, _ = self._predictions_and_errors(
+                model, z_list, x_batch, act_fn, L, n, scalings,
+                dyt_norm, dyt_indices, dyt_list,
+            )
+            e_L = self._highway_e_top(
+                e, mu_L=mu[L - 1], y=y_batch, loss_type=loss_type,
+            )
+        else:
+            e = self.compute_errors(bundle, z, x_batch, y_batch)
+            e_L = e[L - 1]
 
         delta_V = []
         for idx, i in enumerate(S):

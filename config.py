@@ -56,6 +56,7 @@ VARIANT_REC_LRA = "rec_lra"
 VARIANT_CNN_REC_LRA = "cnn_rec_lra"
 VARIANT_RES_ERROR_NET = "res_error_net"
 VARIANT_RES_ERROR_NET_RESNET18 = "res_error_net_resnet18"
+VARIANT_RES_ERROR_NET_SIMPLE_CNN = "res_error_net_simple_cnn"
 
 ALL_VARIANTS = [
     VARIANT_BASELINE, VARIANT_RESNET, VARIANT_BF,
@@ -63,6 +64,7 @@ ALL_VARIANTS = [
     VARIANT_DYT_V3, VARIANT_MUPC, VARIANT_REC_LRA,
     VARIANT_CNN_REC_LRA, VARIANT_RES_ERROR_NET,
     VARIANT_RES_ERROR_NET_RESNET18,
+    VARIANT_RES_ERROR_NET_SIMPLE_CNN,
 ]
 
 
@@ -145,8 +147,8 @@ class ExperimentConfig:
     # dimensions match.
     res_forward_skip_every: int = 0
     res_alpha: float = 1
-    res_inference_T: int = 30
-    res_inference_dt: float = 0.01
+    res_inference_T: int = 100
+    res_inference_dt: float = 0.005
     # "euler" → plain gradient flow ż = -∂F/∂z (sensitive to dt).
     # "adam"  → per-coordinate adaptive Adam-on-z; dt is treated as a
     # learning rate, much more robust to its value.
@@ -234,6 +236,53 @@ class ExperimentConfig:
     # so the CNN variant can be stabilized without affecting the MLP one.
     # Larger values shrink V more aggressively and keep highway norms bounded.
     res_resnet_v_reg: float = 0.1
+
+    # res-error-net-simple-cnn specific (plain conv-stack backbone). Uses the
+    # same Stem/Head modules and DyT normalization as the ResNet-18 sibling,
+    # but the forward path is a chain of single-conv blocks (no in-block
+    # residual). Designed to clear MNIST 95%+ at 3 conv blocks and scale to
+    # deeper CIFAR-10 configurations by extending `res_simple_cnn_channels`.
+    # Trainer-side knobs (alpha, dt, v_lr, optim, loss, v_reg, v_init_scale)
+    # are shared with the MLP variant via the existing `res_*` fields — the
+    # entries below cover only architecture, not training.
+    # Channel list — first entry is the stem, the rest are conv blocks.
+    res_simple_cnn_channels: List[int] = field(
+        default_factory=lambda: [16, 32, 64]
+    )
+    # Per-block stride. None ⇒ stem at stride 1, every subsequent block at
+    # stride 2 (canonical halving layout). When provided, must match the
+    # length of `res_simple_cnn_channels`.
+    res_simple_cnn_strides: Optional[List[int]] = None
+    res_simple_cnn_kernel_size: int = 3
+    # Auto-derived from dataset when None: MNIST/FashionMNIST → (1,28,28),
+    # CIFAR10 → (3,32,32). Override only for non-standard inputs.
+    res_simple_cnn_input_shape: Optional[List[int]] = None
+    res_simple_cnn_normalization: str = "dyt"          # "dyt" or "none"
+    res_simple_cnn_dyt_init_alpha: float = 0.5
+    # "post" (conv → act → DyT) tracks the user-validated MLP recipe
+    # (--res-dyt-norm post). "pre" puts DyT before the activation.
+    res_simple_cnn_dyt_position: str = "post"
+    # "flatten" (default): full Linear(C·H·W → output_dim). Required for the
+    # backward pull from e^L to z^{L-2} to be strong enough that T-step
+    # inference can settle hidden states. "gap" uses GAP+Linear (fewer
+    # params, but pull is divided by H·W).
+    res_simple_cnn_head_type: str = "flatten"
+    res_simple_cnn_highway_include_stem: bool = True
+    # T-step inference loop length. CNN steps are ~10× costlier than the MLP
+    # equivalent; 20 is a reasonable starting point for MNIST. Override of
+    # the shared `res_inference_T` for CNN cost reasons.
+    res_simple_cnn_inference_T: int = 20
+    # Adam-on-z (matches the MLP variant's default and the user-validated MNIST
+    # recipe). With Euler and the shared `res_inference_dt`=0.005 the per-step
+    # movement is too small for the conv state to settle in T=20 steps.
+    res_simple_cnn_inference_method: str = "adam"      # "euler" or "adam"
+    # 0.01 matches the MLP variant's default and the v_nonlearnable report's
+    # recommendation. With this scale the CNN reaches ~93.5% on MNIST in
+    # 3000 iters under both `--res-v-frozen` and learnable V (within seed
+    # jitter, mirroring the MLP report's headline). Larger init (e.g. 0.1)
+    # gives faster early learning but plateaus around 89% — same pathology
+    # as the report's group 4 result.
+    res_simple_cnn_v_init_scale: float = 0.01
 
     # Condition number experiment
     cond_width: int = COND_WIDTH

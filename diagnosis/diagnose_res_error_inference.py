@@ -203,6 +203,10 @@ def train_with_snapshots(variant, bundle, cfg, vcfg):
     v_optim = optax.adamw(vcfg["v_lr"], weight_decay=cfg.weight_decay, eps=1e-12)
     w_opt_state = variant.init_w_optim_states(bundle, w_optim)
     v_opt_state = variant.init_v_optim_states(bundle, v_optim)
+    if hasattr(variant, "init_dyt_optim_states"):
+        dyt_opt_state = variant.init_dyt_optim_states(bundle, w_optim)
+    else:
+        dyt_opt_state = []
 
     train_loader, _ = get_dataloaders(cfg.dataset, cfg.batch_size, use_zca=False)
     noise_key = jr.PRNGKey(cfg.seed + 1)
@@ -234,9 +238,14 @@ def train_with_snapshots(variant, bundle, cfg, vcfg):
             z_init=z_init, record_energy=False,
         )
 
-        delta_W = _jit_compute_W_updates(
+        wupd = _jit_compute_W_updates(
             variant, bundle, z, img_batch, label_batch, vcfg["alpha"]
         )
+        # MLP variant returns (delta_W, delta_dyt); resnet18 returns flat list.
+        if isinstance(wupd, tuple) and len(wupd) == 2 and isinstance(wupd[0], list):
+            delta_W, delta_dyt = wupd
+        else:
+            delta_W, delta_dyt = wupd, []
         delta_V = _jit_compute_V_updates(
             variant, bundle, z, img_batch, label_batch, vcfg["alpha"],
             vcfg["v_rule"], vcfg["v_reg"],
@@ -252,10 +261,17 @@ def train_with_snapshots(variant, bundle, cfg, vcfg):
                               cfg.global_clip_norm / (g_norm + 1e-12), 1.0)
             delta_W = [dw * scale for dw in delta_W]
 
-        bundle, w_opt_state, v_opt_state = variant.apply_optax_updates(
-            bundle, delta_W, delta_V,
-            w_optim, w_opt_state, v_optim, v_opt_state,
-        )
+        if hasattr(variant, "init_dyt_optim_states"):
+            bundle, w_opt_state, v_opt_state, dyt_opt_state = variant.apply_optax_updates(
+                bundle, delta_W, delta_V,
+                w_optim, w_opt_state, v_optim, v_opt_state,
+                delta_dyt=delta_dyt, dyt_opt_state=dyt_opt_state,
+            )
+        else:
+            bundle, w_opt_state, v_opt_state = variant.apply_optax_updates(
+                bundle, delta_W, delta_V,
+                w_optim, w_opt_state, v_optim, v_opt_state,
+            )
 
         # Cheap loss readout (feed-forward MSE)
         z_ff, _ = _jit_forward_pass(variant, bundle, img_batch)

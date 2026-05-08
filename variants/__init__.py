@@ -6,6 +6,7 @@ from config import (
     VARIANT_DYT_V3, VARIANT_MUPC, VARIANT_REC_LRA,
     VARIANT_CNN_REC_LRA, VARIANT_RES_ERROR_NET,
     VARIANT_RES_ERROR_NET_RESNET18,
+    VARIANT_RES_ERROR_NET_SIMPLE_CNN,
 )
 from variants.baseline import BaselineVariant
 from variants.resnet import ResNetVariant
@@ -19,6 +20,7 @@ from variants.rec_lra import RecLRAVariant
 from variants.cnn_rec_lra import CNNRecLRAVariant
 from variants.res_error_net import ResErrorNetVariant
 from variants.res_error_net_resnet18 import ResErrorNetResNet18Variant
+from variants.res_error_net_simple_cnn import ResErrorNetSimpleCNNVariant
 
 VARIANT_REGISTRY = {
     VARIANT_BASELINE: BaselineVariant,
@@ -33,6 +35,7 @@ VARIANT_REGISTRY = {
     VARIANT_CNN_REC_LRA: CNNRecLRAVariant,
     VARIANT_RES_ERROR_NET: ResErrorNetVariant,
     VARIANT_RES_ERROR_NET_RESNET18: ResErrorNetResNet18Variant,
+    VARIANT_RES_ERROR_NET_SIMPLE_CNN: ResErrorNetSimpleCNNVariant,
 }
 
 
