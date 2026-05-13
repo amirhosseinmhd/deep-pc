@@ -73,6 +73,8 @@ def run_single(cfg):
                 extra_create_kwargs = dict(
                     alpha_e_skip=cfg.alpha_e_skip,
                     alpha_e_adj=cfg.alpha_e_adj,
+                    forward_skip_every=cfg.forward_skip_every,
+                    error_skip_every=cfg.error_skip_every,
                 )
             if cfg.variant == VARIANT_CNN_REC_LRA:
                 extra_create_kwargs.update(dict(
@@ -95,6 +97,7 @@ def run_single(cfg):
                     dyt_init_alpha=cfg.res_dyt_init_alpha,
                     dyt_layers=cfg.res_dyt_layers,
                     loss_type=cfg.res_loss,
+                    forward_skip_every=cfg.res_forward_skip_every,
                 )
             if cfg.variant == VARIANT_RES_ERROR_NET_RESNET18:
                 extra_create_kwargs = dict(
@@ -140,8 +143,6 @@ def run_single(cfg):
                 input_dim=cfg.input_dim, output_dim=cfg.output_dim,
                 init_alpha=cfg.init_alpha,
                 activity_noise=cfg.activity_noise,
-                forward_skip_every=cfg.forward_skip_every,
-                error_skip_every=cfg.error_skip_every,
                 **extra_create_kwargs,
             )
 
@@ -400,6 +401,11 @@ def main():
     parser.add_argument(
         "--res-highway-every-k", type=int, default=None,
         help="Stride of V_{L->i} highways (res-error-net, default: 2)",
+    )
+    parser.add_argument(
+        "--res-forward-skip-every", type=int, default=None,
+        help="Forward skip interval n>0 adds z^{l-n} to layer-l prediction "
+             "when dims match; 0 disables (res-error-net, default: 0)",
     )
     parser.add_argument(
         "--res-alpha", type=float, default=None,
@@ -668,6 +674,8 @@ def main():
             overrides["use_zca"] = True
         if args.res_highway_every_k is not None:
             overrides["res_highway_every_k"] = args.res_highway_every_k
+        if args.res_forward_skip_every is not None:
+            overrides["res_forward_skip_every"] = args.res_forward_skip_every
         if args.res_alpha is not None:
             overrides["res_alpha"] = args.res_alpha
         if args.res_inference_T is not None:
