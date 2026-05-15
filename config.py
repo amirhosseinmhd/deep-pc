@@ -110,8 +110,8 @@ class ExperimentConfig:
     activity_noise: float = 0.0
 
     # rec-LRA specific (defaults from Ororbia & Mali 2023, p.15)
-    forward_skip_every: int = 2
-    error_skip_every: int = 2
+    forward_skip_every: int = 0
+    error_skip_every: int = 0
 
     beta: float = 0.1205
     gamma_E: float = 0.1524
@@ -141,7 +141,7 @@ class ExperimentConfig:
     kernel_size: int = 3
 
     # res-error-net specific
-    res_highway_every_k: int = 3
+    res_highway_every_k: int = 1
     # Optional forward residual skip interval for the MLP res-error-net.
     # 0 disables skips; n>0 adds z^{l-n} into the prediction of layer l when
     # dimensions match.
@@ -178,8 +178,8 @@ class ExperimentConfig:
     # "off" → no DyT (default; bit-exact with prior runs).
     # "pre" → DyT applied to a layer's input (before the linear).
     # "post" → DyT applied to the layer output (after the activation).
-    res_dyt_norm: str = "off"
-    res_dyt_init_alpha: float = 0.5
+    res_dyt_norm: str = "pre"
+    res_dyt_init_alpha: float = 0.4
     # Which layers get a DyT module. "hidden" = layers 1..L-2; "all_internal"
     # = layers 0..L-2. The output layer L-1 is always excluded (z[L-1] is
     # hard-clamped to y, so DyT'ing the prediction would distort supervision).
