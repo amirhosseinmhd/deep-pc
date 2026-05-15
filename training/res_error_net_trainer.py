@@ -127,17 +127,27 @@ def train_res_error_net(
     alpha_schedule="fixed",
     alpha_min=0.0,
     freeze_v=False,
+    param_lr_schedule="fixed",
+    param_lr_min=0.0,
 ):
     """Train a res-error-net and record all metrics."""
     set_seed(seed)
 
     use_optax = optim_type in ("adam", "adamw")
     if use_optax:
+        if param_lr_schedule == "cosine" and param_lr > 0:
+            w_lr = optax.cosine_decay_schedule(
+                init_value=param_lr,
+                decay_steps=n_train_iters,
+                alpha=param_lr_min / param_lr,
+            )
+        else:
+            w_lr = param_lr
         if optim_type == "adamw":
-            w_optim = optax.adamw(param_lr, weight_decay=weight_decay, eps=1e-12)
+            w_optim = optax.adamw(w_lr, weight_decay=weight_decay, eps=1e-12)
             v_optim = optax.adamw(v_lr, weight_decay=weight_decay, eps=1e-12)
         else:
-            w_optim = optax.adam(param_lr, eps=1e-12)
+            w_optim = optax.adam(w_lr, eps=1e-12)
             v_optim = optax.adam(v_lr, eps=1e-12)
         w_opt_state = variant.init_w_optim_states(bundle, w_optim)
         v_opt_state = variant.init_v_optim_states(bundle, v_optim)

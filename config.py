@@ -92,6 +92,8 @@ class ExperimentConfig:
     seed: int = SEED
     activity_lr: float = ACTIVITY_LR
     param_lr: float = PARAM_LR
+    param_lr_schedule: str = "fixed"   # "fixed" or "cosine"
+    param_lr_min: float = 0.0          # endpoint of cosine decay over n_train_iters
     batch_size: int = BATCH_SIZE
     n_train_iters: int = N_TRAIN_ITERS
     test_every: int = TEST_EVERY

@@ -190,6 +190,8 @@ def run_single(cfg):
                     alpha_schedule=cfg.res_alpha_schedule,
                     alpha_min=cfg.res_alpha_min,
                     freeze_v=cfg.res_v_frozen,
+                    param_lr_schedule=cfg.param_lr_schedule,
+                    param_lr_min=cfg.param_lr_min,
                 )
             elif cfg.variant in (VARIANT_REC_LRA, VARIANT_CNN_REC_LRA):
                 res = train_rec_lra(
@@ -304,6 +306,14 @@ def main():
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--activity-lr", type=float, default=None)
     parser.add_argument("--param-lr", type=float, default=None)
+    parser.add_argument(
+        "--param-lr-schedule", choices=["fixed", "cosine"], default=None,
+        help="Schedule for param_lr over n_train_iters (default: fixed).",
+    )
+    parser.add_argument(
+        "--param-lr-min", type=float, default=None,
+        help="Endpoint of cosine decay for param_lr (default: 0.0).",
+    )
     parser.add_argument(
         "--no-weight-updates", action="store_true",
         help="Disable weight update tracking",
@@ -626,6 +636,10 @@ def main():
             overrides["activity_lr"] = args.activity_lr
         if args.param_lr:
             overrides["param_lr"] = args.param_lr
+        if args.param_lr_schedule is not None:
+            overrides["param_lr_schedule"] = args.param_lr_schedule
+        if args.param_lr_min is not None:
+            overrides["param_lr_min"] = args.param_lr_min
         if args.no_weight_updates:
             overrides["track_weight_updates"] = False
         if args.no_activity_norms:
