@@ -376,6 +376,10 @@ def main():
         help="Gaussian-ball radius for update re-projection. 0 disables (default: 1.0)",
     )
     parser.add_argument(
+        "--global-clip-norm", type=float, default=None,
+        help="Global Frobenius-norm clip on delta_W (res-error-net). 0 disables (default: 0).",
+    )
+    parser.add_argument(
         "--input-noise-sigma", type=float, default=None,
         help="Stdev of Gaussian noise added to inputs. 0 disables (default: 0.1)",
     )
@@ -674,6 +678,8 @@ def main():
             overrides["rec_lra_e_update"] = args.rec_lra_e_update
         if args.reproject_c is not None:
             overrides["reproject_c"] = args.reproject_c
+        if args.global_clip_norm is not None:
+            overrides["global_clip_norm"] = args.global_clip_norm
         if args.input_noise_sigma is not None:
             overrides["input_noise_sigma"] = args.input_noise_sigma
         if args.weight_decay is not None:
